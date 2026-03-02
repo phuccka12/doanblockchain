@@ -6,14 +6,14 @@ import numpy as np
 import cv2
 import hashlib
 import imagehash 
-from PIL import Image
+from PIL import Image, ImageChops, ImageEnhance
 import io
 import base64
 import requests
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="TrustLens - Level 5 (Super Vision)")
+app = FastAPI(title="TrustLens - Hệ thống Bảo vệ Bản quyền (Blockchain & AI)")
 
 origins = ["*"]
 app.add_middleware(
@@ -26,7 +26,6 @@ app.add_middleware(
 )
 
 DB_PATH = "seal.db"
-# Cấu hình Pinata (Giữ nguyên của bạn)
 PINATA_API_KEY = "YOUR_PINATA_KEY" 
 PINATA_SECRET_API_KEY = "YOUR_SECRET_KEY"
 
@@ -46,7 +45,9 @@ def db_init():
         """)
 db_init()
 
-# --- CÁC HÀM TIỆN ÍCH CƠ BẢN ---
+# ==========================================
+# 1. CÁC HÀM TIỆN ÍCH CƠ BẢN (HASH & IPFS)
+# ==========================================
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -57,33 +58,7 @@ def calc_dhash(image_bytes: bytes) -> str:
 def hamming_distance(s1: str, s2: str) -> int:
     return sum(c1 != c2 for c1, c2 in zip(s1, s2))
 
-def embed_lsb_manual(img, text_id):
-    # (Giữ nguyên hàm embed cũ của bạn)
-    binary_id = ''.join(format(ord(i), '08b') for i in text_id) + '11111111'
-    data_len = len(binary_id)
-    flat_img = img.flatten()
-    if data_len > len(flat_img): return img
-    for i in range(data_len):
-        flat_img[i] = (flat_img[i] & 254) | int(binary_id[i])
-    return flat_img.reshape(img.shape)
-
-def extract_lsb_manual(img):
-    # (Giữ nguyên hàm extract cũ của bạn)
-    flat_img = img.flatten()
-    binary_data = ""
-    for i in range(min(len(flat_img), 2000)): 
-        binary_data += str(flat_img[i] & 1)
-        if binary_data.endswith('11111111'):
-            binary_data = binary_data[:-8]
-            break
-    chars = []
-    for i in range(0, len(binary_data), 8):
-        byte = binary_data[i:i+8]
-        if len(byte) == 8: chars.append(chr(int(byte, 2)))
-    return "".join(chars)
-
 def upload_to_ipfs(file_bytes):
-    # (Giữ nguyên hàm upload IPFS cũ của bạn)
     if "YOUR" in PINATA_API_KEY: return None
     url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
     headers = {"pinata_api_key": PINATA_API_KEY, "pinata_secret_api_key": PINATA_SECRET_API_KEY}
@@ -94,95 +69,128 @@ def upload_to_ipfs(file_bytes):
     except: pass
     return None
 
-# --- [NÂNG CẤP LEVEL 5] SUPER VISION: ALIGN IMAGES ---
-# Hàm này tự động xoay, nắn chỉnh ảnh Fake cho khớp với ảnh Gốc
-def align_images(img_fake, img_real):
-    # Chuyển sang ảnh xám
-    gray_fake = cv2.cvtColor(img_fake, cv2.COLOR_BGR2GRAY)
-    gray_real = cv2.cvtColor(img_real, cv2.COLOR_BGR2GRAY)
+# ==========================================
+# 2. LÕI KỸ THUẬT: THỦY VÂN TẦN SỐ (DCT) 
+# Chống nén ảnh JPEG, Resize, Cắt xén
+# ==========================================
+Q = 30 # Hệ số lượng tử hóa. Q càng lớn -> Càng khó bị xóa nhưng ảnh gốc hơi nhiễu
 
-    # Dùng thuật toán ORB (Oriented FAST and Rotated BRIEF) để tìm điểm đặc trưng
-    # Đây là "Mắt thần" giúp nhận diện ảnh dù bị xoay
-    orb = cv2.ORB_create(500)
-    kp1, des1 = orb.detectAndCompute(gray_fake, None)
-    kp2, des2 = orb.detectAndCompute(gray_real, None)
-
-    # Khớp các điểm đặc trưng
-    matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
-    matches = matcher.match(des1, des2, None)
-
-    # Sắp xếp lấy các điểm khớp nhất (Top 15%)
-    matches.sort(key=lambda x: x.distance, reverse=False)
-    numGoodMatches = int(len(matches) * 0.15)
-    matches = matches[:numGoodMatches]
-
-    # Nếu tìm thấy đủ điểm giống nhau
-    if len(matches) > 10:
-        # Trích xuất tọa độ các điểm
-        points1 = np.zeros((len(matches), 2), dtype=np.float32)
-        points2 = np.zeros((len(matches), 2), dtype=np.float32)
-
-        for i, match in enumerate(matches):
-            points1[i, :] = kp1[match.queryIdx].pt
-            points2[i, :] = kp2[match.trainIdx].pt
-
-        # Tìm ma trận biến đổi (Homography)
-        h, mask = cv2.findHomography(points1, points2, cv2.RANSAC)
-
-        # Nắn chỉnh ảnh Fake theo ảnh Real
-        height, width, channels = img_real.shape
-        img_fake_aligned = cv2.warpPerspective(img_fake, h, (width, height))
-        
-        return img_fake_aligned
-    else:
-        # Nếu không tìm thấy đủ điểm khớp, trả về resize thường (fallback)
-        h, w, _ = img_fake.shape
-        return cv2.resize(img_real, (w, h))
-
-def detect_forgery(img_fake_bgr, img_real_bgr):
-    # [NÂNG CẤP] Bước 1: Nắn chỉnh ảnh thông minh
-    try:
-        img_fake_aligned = align_images(img_fake_bgr, img_real_bgr)
-    except:
-        # Fallback nếu lỗi
-        h, w, _ = img_fake_bgr.shape
-        img_fake_aligned = cv2.resize(img_fake_bgr, (w, h)) # Chỉ resize ảnh fake về size real thì sai logic so sánh
-
-    # Đảm bảo 2 ảnh cùng kích thước để trừ
-    h, w, _ = img_fake_aligned.shape
-    img_real_resized = cv2.resize(img_real_bgr, (w, h))
-
-    # Bước 2: Trừ ảnh (Image Differencing)
-    diff = cv2.absdiff(img_fake_aligned, img_real_resized)
-    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+def embed_dct_blind(img, text_id):
+    """Giấu ID bản quyền vào miền tần số DCT"""
+    binary_id = ''.join(format(ord(i), '08b') for i in text_id) + '1111111111111111'
     
-    # Bước 3: Lọc nhiễu (Threshold & Morph)
-    _, thresh = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY)
+    img_yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
+    y, u, v = cv2.split(img_yuv)
+    
+    y_dct = cv2.dct(np.float32(y))
+    
+    start_idx = 20 
+    for i, bit in enumerate(binary_id):
+        row, col = start_idx + i, start_idx + i
+        if row >= y_dct.shape[0] or col >= y_dct.shape[1]: break
+        
+        val = y_dct[row, col]
+        quotient = round(val / Q)
+        
+        if int(bit) == 1:
+            if quotient % 2 == 0: quotient += 1 
+        else:
+            if quotient % 2 != 0: quotient += 1 
+            
+        y_dct[row, col] = quotient * Q
+        
+    y_idct = cv2.idct(y_dct)
+    y_idct = np.clip(y_idct, 0, 255).astype(np.uint8)
+    
+    return cv2.cvtColor(cv2.merge((y_idct, u, v)), cv2.COLOR_YUV2BGR)
+
+def extract_dct_blind(img):
+    """Trích xuất ID bản quyền từ miền tần số (Không cần ảnh gốc)"""
+    img_yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
+    y, _, _ = cv2.split(img_yuv)
+    y_dct = cv2.dct(np.float32(y))
+    
+    extracted_bits = ""
+    start_idx = 20
+    
+    for i in range(2000):
+        row, col = start_idx + i, start_idx + i
+        if row >= y_dct.shape[0] or col >= y_dct.shape[1]: break
+        
+        val = y_dct[row, col]
+        quotient = round(val / Q)
+        
+        if quotient % 2 == 0: extracted_bits += '0'
+        else: extracted_bits += '1'
+            
+        if extracted_bits.endswith('1111111111111111'):
+            extracted_bits = extracted_bits[:-16]
+            break
+            
+    chars = []
+    for i in range(0, len(extracted_bits), 8):
+        byte = extracted_bits[i:i+8]
+        if len(byte) == 8:
+            try: chars.append(chr(int(byte, 2)))
+            except: pass
+            
+    res = "".join(chars)
+    return ''.join(filter(lambda x: x.isprintable(), res))
+
+# ==========================================
+# 3. LÕI KỸ THUẬT AI: PHÁT HIỆN GIẢ MẠO (ELA)
+# Tự động soi vết Photoshop cắt ghép
+# ==========================================
+def perform_ela(image_bytes, quality=90):
+    """Thuật toán ELA (Error Level Analysis) tìm vùng khác biệt mức độ nén"""
+    original_img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    
+    temp_io = io.BytesIO()
+    original_img.save(temp_io, 'JPEG', quality=quality)
+    temp_io.seek(0)
+    compressed_img = Image.open(temp_io)
+    
+    ela_image = ImageChops.difference(original_img, compressed_img)
+    
+    extrema = ela_image.getextrema()
+    max_diff = max([ex[1] for ex in extrema])
+    if max_diff == 0: max_diff = 1
+    scale = 255.0 / max_diff
+    ela_image = ImageEnhance.Brightness(ela_image).enhance(scale)
+    
+    ela_cv = cv2.cvtColor(np.array(ela_image), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(ela_cv, cv2.COLOR_BGR2GRAY)
+    
+    _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
     kernel = np.ones((5,5), np.uint8)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
-    # Bước 4: Khoanh vùng
+    
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    img_result = img_fake_aligned.copy() # Vẽ lên ảnh đã nắn chỉnh
+    
+    img_upload_cv = cv2.cvtColor(np.array(original_img), cv2.COLOR_RGB2BGR)
     has_forgery = False
     
     for cnt in contours:
-        if cv2.contourArea(cnt) > 400: # Lọc vùng nhỏ
+        if cv2.contourArea(cnt) > 300: 
             has_forgery = True
             x, y, w, h = cv2.boundingRect(cnt)
-            cv2.rectangle(img_result, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            cv2.rectangle(img_upload_cv, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            cv2.putText(img_upload_cv, "AI: Fake Detected", (x, y - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    return has_forgery, img_result
+    return has_forgery, img_upload_cv
 
-# --- API ENDPOINTS ---
-
+# ==========================================
+# 4. API ENDPOINTS
+# ==========================================
 @app.post("/seal")
 async def seal(file: UploadFile = File(...), watermark_id: str = Form(...)):
     raw = await file.read()
     nparr = np.frombuffer(raw, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    sealed_img = embed_lsb_manual(img, watermark_id)
+    # Đóng dấu DCT
+    sealed_img = embed_dct_blind(img, watermark_id)
     _, img_png = cv2.imencode(".png", sealed_img)
     sealed_bytes = img_png.tobytes()
     
@@ -238,7 +246,8 @@ def process_verification(raw_bytes):
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img_upload = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
-    try: wm = extract_lsb_manual(img_upload)
+    # Trích xuất bản quyền bằng DCT
+    try: wm = extract_dct_blind(img_upload)
     except: wm = ""
 
     best_match = None
@@ -254,14 +263,44 @@ def process_verification(raw_bytes):
                 min_dist = dist
                 forgery_b64 = None
                 
-                # Logic thông minh: Chỉ check Forgery nếu khoảng cách nhỏ
-                if 0 < dist < 25 and db_blob:
-                    nparr_db = np.frombuffer(db_blob, np.uint8)
-                    img_real = cv2.imdecode(nparr_db, cv2.IMREAD_COLOR)
+                # LOGIC AI THÔNG MINH KÉP (Trừ ảnh vật lý + ELA)
+                if dist <= 25 and image_hash != db_sha:
+                    is_forged = False
+                    img_result = img_upload.copy()
                     
-                    # [GỌI HÀM NÂNG CẤP]
-                    is_forged, img_result = detect_forgery(img_upload, img_real)
-                    
+                    # CHIẾN THUẬT 1: Trừ điểm ảnh (Bắt lỗi vẽ bậy, chèn chữ siêu chuẩn)
+                    if db_blob:
+                            nparr_db = np.frombuffer(db_blob, np.uint8)
+                            img_real = cv2.imdecode(nparr_db, cv2.IMREAD_COLOR)
+                            
+                            h, w, _ = img_upload.shape
+                            img_real_resized = cv2.resize(img_real, (w, h))
+                            
+                            diff = cv2.absdiff(img_upload, img_real_resized)
+                            gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                            
+                            # Hạ Threshold xuống 20 để nhạy hơn với các nét bút mờ
+                            _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+                            
+                            # [SỬA Ở ĐÂY] Tăng size kernel và dùng DILATE để nối các nét chữ rời rạc thành 1 khối
+                            kernel = np.ones((15, 15), np.uint8) 
+                            thresh = cv2.dilate(thresh, kernel, iterations=2) 
+                            
+                            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            
+                            for cnt in contours:
+                                if cv2.contourArea(cnt) > 200: # Tăng diện tích lọc nhiễu lên một chút
+                                    is_forged = True
+                                    x, y, bw, bh = cv2.boundingRect(cnt)
+                                    # Vẽ khung to hơn vùng phát hiện 5 pixel cho đẹp mắt
+                                    cv2.rectangle(img_result, (x - 5, y - 5), (x + bw + 5, y + bh + 5), (0, 0, 255), 3)
+                                    cv2.putText(img_result, "Fake Detected", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+                    # CHIẾN THUẬT 2: Nếu trừ ảnh không bắt được vết, dùng ELA quét lớp nén
+                    if not is_forged:
+                        is_forged, img_result = perform_ela(raw_bytes)
+
+                    # Đóng gói ảnh báo cáo gửi về Frontend
                     if is_forged:
                         _, buf = cv2.imencode('.png', img_result)
                         forgery_b64 = base64.b64encode(buf).decode('utf-8')
@@ -273,13 +312,34 @@ def process_verification(raw_bytes):
                     "forgery_image": forgery_b64
                 }
 
-    # Lọc ảnh lạ
     if best_match and best_match['distance'] > 25:
-        best_match = None 
+        best_match = None
+
+    with db_conn() as con:
+        total = con.execute("SELECT COUNT(*) FROM sealed_records").fetchone()[0]
 
     return JSONResponse({
         "sha256": image_hash,
         "dhash": current_dhash,
         "watermark_id_extracted": wm,
-        "best_match": best_match
+        "best_match": best_match,
+        "total_in_db": total
     })
+
+@app.get("/records")
+def get_records(limit: int = 20):
+    """Return recent sealed records and total count for dashboard use."""
+    with db_conn() as con:
+        rows = con.execute("SELECT sha256, dhash, watermark_id, created_at FROM sealed_records ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        total = con.execute("SELECT COUNT(*) FROM sealed_records").fetchone()[0]
+
+    records = []
+    for r in rows:
+        records.append({
+            "sha256": r[0],
+            "dhash": r[1],
+            "watermark_id": r[2],
+            "created_at": r[3]
+        })
+
+    return JSONResponse({"total": total, "records": records})
