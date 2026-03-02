@@ -1,0 +1,3 @@
+export const BACKEND_URL = "http://127.0.0.1:8000";
+export const CONTRACT_ADDRESS = "0xDA0bab807633f07f013f94DD0E6A4F96F8742B53";
+export const SEPOLIA_CHAIN_ID_HEX = "0xaa36a7"; // 11155111 in hex
