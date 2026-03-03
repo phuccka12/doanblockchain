@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
-import { BACKEND_URL } from "../config";
+import { BACKEND_URL, CONTRACT_ADDRESS } from "../config";
+import { ethers } from "ethers";
+import abi from "../abi/ImageRegistryABI.json";
 
 const STATS = [
   { icon:"🖼️", label:"Tổng tác phẩm",  value:"2,847", trend:"+12%", up:true  },
@@ -8,11 +10,7 @@ const STATS = [
   { icon:"💰", label:"Giá trị ước tính", value:"$48K",  trend:"+21%", up:true  },
 ];
 const BARS = [40,60,45,75,85,60,95];
-const ALERTS = [
-  { time:"10 phút trước", msg:"Phát hiện bản sao ảnh #1823 trên mạng xã hội",  sev:"high"   },
-  { time:"1 giờ trước",   msg:"Tác phẩm #1205 có dấu hiệu chỉnh sửa (ELA)",     sev:"medium" },
-  { time:"3 giờ trước",   msg:"Yêu cầu cấp phép từ Studio XYZ cho ảnh #0892",   sev:"low"    },
-];
+// Alerts will be fetched from backend (/alerts)
 const WORKS = [
   { id:"#1823", name:"Sunrise Over Hanoi",  date:"01/06/2025", status:"Xác thực",    color:"#4ade80" },
   { id:"#1205", name:"Digital Flora #7",    date:"03/06/2025", status:"Cảnh báo",    color:"#fbbf24" },
@@ -26,23 +24,75 @@ const SEV = { high:{bg:"rgba(239,68,68,.12)",bd:"rgba(239,68,68,.25)",c:"#fca5a5
 export default function Dashboard() {
   const [works, setWorks]   = useState([]);
   const [total, setTotal]   = useState(null);
+  const [registeredTotal, setRegisteredTotal] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [alerts, setAlerts] = useState([]);
+  const [nftCountLocal, setNftCountLocal] = useState(null);
 
   useEffect(() => {
-    fetch(`${BACKEND_URL}/records?limit=20`)
+    fetch(`${BACKEND_URL}/records?limit=20&registered_only=true`)
       .then(r => r.json())
       .then(data => {
         setTotal(data.total ?? data.records?.length ?? 0);
+        // registered_total = NFT đã đúc (confirmed on-chain) across all users
+        if (data.registered_total != null) setRegisteredTotal(data.registered_total);
         setWorks(data.records ?? []);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
 
-  // Merge real total into STATS[0]
-  const statsDisplay = STATS.map((st, i) =>
-    i === 0 && total !== null ? { ...st, value: total.toLocaleString() } : st
-  );
+  // On-chain: if wallet connected, fetch balanceOf (NFT count) for that address
+  useEffect(() => {
+    const fetchOnChain = async () => {
+      if (!window.ethereum) return;
+      try {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        // try to get currently connected accounts without prompting
+        const accounts = await provider.send("eth_accounts", []);
+        if (!accounts || accounts.length === 0) return;
+        const address = accounts[0];
+        const ct = new ethers.Contract(CONTRACT_ADDRESS, abi, provider);
+  const bal = await ct.balanceOf(address);
+  // store nft count locally so we can display it in the stat card
+  setNftCountLocal(Number(bal.toString()));
+      } catch (e) {
+        console.error("onchain fetch error", e);
+      }
+    };
+    fetchOnChain();
+  }, []);
+
+  useEffect(() => {
+    fetch(`${BACKEND_URL}/alerts?limit=5`)
+      .then(r => r.json())
+      .then(data => setAlerts(data.alerts ?? []))
+      .catch(() => {});
+  }, []);
+
+  const timeAgo = (tsSeconds) => {
+    if (!tsSeconds) return "";
+    const d = Date.now() - (tsSeconds * 1000);
+    const mins = Math.floor(d / 60000);
+    if (mins < 1) return "vừa xong";
+    if (mins < 60) return `${mins} phút trước`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs} giờ trước`;
+    const days = Math.floor(hrs / 24);
+    return `${days} ngày trước`;
+  };
+
+  // Merge real total into STATS[0] and on-chain NFT count into STATS[1]
+  const statsDisplay = STATS.map((st, i) => {
+    // "Tổng tác phẩm" = tổng đã đăng ký on-chain (registered_total)
+    if (i === 0 && registeredTotal !== null) return { ...st, value: registeredTotal.toLocaleString() };
+    // "NFT đã đúc" = cùng registered_total (mỗi ảnh đăng ký = 1 NFT)
+    if (i === 1) {
+      if (registeredTotal !== null) return { ...st, value: registeredTotal.toLocaleString() };
+      if (nftCountLocal !== null) return { ...st, value: nftCountLocal.toLocaleString() };
+    }
+    return st;
+  });
 
   const s = {
     page:  { minHeight:"100vh",background:"#080818",color:"#fff",fontFamily:"Inter,system-ui,sans-serif" },
@@ -110,13 +160,17 @@ export default function Dashboard() {
           <div style={s.card}>
             <h3 style={s.cTit}><span style={s.dot("#ef4444")}/>Cảnh báo AI gần đây</h3>
             <div style={{ display:"flex",flexDirection:"column",gap:10 }}>
-              {ALERTS.map((a,i)=>(
-                <div key={i} style={{ padding:"12px 14px",borderRadius:10,
-                                      background:SEV[a.sev].bg, border:`1px solid ${SEV[a.sev].bd}` }}>
-                  <p style={{ fontSize:13,color:SEV[a.sev].c,fontWeight:600,margin:"0 0 3px" }}>{a.msg}</p>
-                  <p style={{ fontSize:11,color:"#475569",margin:0 }}>{a.time}</p>
-                </div>
-              ))}
+              {alerts.length === 0 ? (
+                <p style={{ color:"#475569",padding:"12px 0",margin:0 }}>Không có cảnh báo gần đây</p>
+              ) : (
+                alerts.map((a,i)=>(
+                  <div key={i} style={{ padding:"12px 14px",borderRadius:10,
+                                        background:SEV[a.severity]?.bg || 'rgba(99,102,241,.06)', border:`1px solid ${SEV[a.severity]?.bd || 'rgba(255,255,255,.04)'}` }}>
+                    <p style={{ fontSize:13,color:SEV[a.severity]?.c || '#a5b4fc',fontWeight:600,margin:"0 0 3px" }}>{a.message}</p>
+                    <p style={{ fontSize:11,color:"#475569",margin:0 }}>{timeAgo(a.created_at)}</p>
+                  </div>
+                ))
+              )}
             </div>
           </div>
         </div>
@@ -132,7 +186,7 @@ export default function Dashboard() {
           <table style={{ width:"100%",borderCollapse:"collapse",fontSize:13 }}>
             <thead>
               <tr style={{ borderBottom:"1px solid rgba(255,255,255,.07)" }}>
-                {["Watermark ID","SHA-256","DHash","Ngày đăng ký","Trạng thái"].map(h=>(
+                {["Watermark ID","Người đăng ký","Tuổi","SHA-256","DHash","Ngày đăng ký","Trạng thái"].map(h=>(
                   <th key={h} style={{ textAlign:"left",padding:"8px 12px",
                                        color:"#475569",fontWeight:600,fontSize:11,textTransform:"uppercase" }}>{h}</th>
                 ))}
@@ -142,11 +196,13 @@ export default function Dashboard() {
               {works.map((w,i)=>(
                 <tr key={i} style={{ borderBottom:"1px solid rgba(255,255,255,.04)" }}>
                   <td style={{ padding:"12px",color:"#818cf8",fontFamily:"monospace" }}>{w.watermark_id || "—"}</td>
+                  <td style={{ padding:"12px",fontWeight:600 }}>{w.registrant_name || "—"}</td>
+                  <td style={{ padding:"12px",color:"#64748b" }}>{w.registrant_age != null ? w.registrant_age : "—"}</td>
                   <td style={{ padding:"12px",fontFamily:"monospace",fontSize:11,color:"#94a3b8",maxWidth:140,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}
                       title={w.sha256}>{w.sha256 ? w.sha256.slice(0,16)+"…" : "—"}</td>
                   <td style={{ padding:"12px",fontFamily:"monospace",fontSize:11,color:"#94a3b8" }}>{w.dhash ? w.dhash.slice(0,12)+"…" : "—"}</td>
                   <td style={{ padding:"12px",color:"#64748b" }}>
-                    {w.created_at ? new Date(w.created_at).toLocaleDateString("vi-VN") : "—"}
+                    {w.created_at ? new Date(w.created_at * 1000).toLocaleDateString("vi-VN") : "—"}
                   </td>
                   <td style={{ padding:"12px" }}>
                     <span style={{ padding:"4px 12px",borderRadius:99,fontSize:11,fontWeight:700,

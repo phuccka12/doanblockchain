@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { useDropzone } from "react-dropzone";
 import { ethers } from "ethers";
 import toast from "react-hot-toast";
@@ -95,6 +95,7 @@ export default function Studio() {
   const [file, setFile]         = useState(null);
   const [preview, setPreview]   = useState(null);
   const [wid, setWid]           = useState("TrustLens_Artist");
+  const [registrantName, setRegistrantName] = useState("");
   const [busy, setBusy]         = useState(false);
   const [pct, setPct]           = useState(0);
   const [task, setTask]         = useState("");
@@ -104,6 +105,8 @@ export default function Studio() {
   const [sealedUrl, setSealedUrl] = useState(null); // blob URL của ảnh đã nhúng thủy vân
   const [gasEth, setGasEth]     = useState(null);  // ước tính phí gas thực (ETH string)
   const [gasUsd, setGasUsd]     = useState(null);  // ước tính phí gas thực (USD string)
+  const [legacyGasHex, setLegacyGasHex] = useState(null); // hex string from eth_gasPrice when fallback
+  const runningRef = useRef(false); // guard against double-click / StrictMode double-invoke
 
   const onDrop = useCallback(fs => {
     const f = fs[0];
@@ -120,7 +123,29 @@ export default function Studio() {
       try {
         if (!window.ethereum) return;
         const provider = new ethers.BrowserProvider(window.ethereum);
-        const feeData  = await provider.getFeeData();
+        // Some providers (or wallet RPC proxies) do not expose `eth_maxPriorityFeePerGas`
+        // which causes provider.getFeeData() to throw. Try getFeeData(), but fall back to
+        // asking the provider for `eth_gasPrice` which is widely supported.
+        let feeData = null;
+        try {
+          feeData = await provider.getFeeData();
+          // clear any previous fallback flag
+          setLegacyGasHex(null);
+        } catch(err) {
+          console.warn("getFeeData failed, falling back to eth_gasPrice:", err);
+          try {
+            const gasPriceHex = await window.ethereum.request({ method: "eth_gasPrice" });
+            const gasPriceBn = BigInt(gasPriceHex);
+            feeData = { gasPrice: gasPriceBn, maxFeePerGas: gasPriceBn, maxPriorityFeePerGas: 0n };
+            // remember the hex so we can use it as an override when sending tx
+            setLegacyGasHex(gasPriceHex);
+          } catch(err2) {
+            console.warn("eth_gasPrice fallback failed:", err2);
+            feeData = { gasPrice: 0n, maxFeePerGas: 0n, maxPriorityFeePerGas: 0n };
+            setLegacyGasHex(null);
+          }
+        }
+
         // gasPrice (wei) * 200_000 gas units (registerCopyright ước tính)
         const GAS_UNITS = 200_000n;
         const gasPrice  = feeData.gasPrice ?? feeData.maxFeePerGas ?? 0n;
@@ -141,12 +166,24 @@ export default function Studio() {
   }, []);
 
   const go = async () => {
+    if (runningRef.current || busy) return; // prevent double-click / concurrent runs
     if (!file) return toast.error("Vui lòng chọn một tác phẩm!");
+    if (!registrantName.trim()) return toast.error("Vui lòng nhập họ và tên người đăng ký!");
     if (!wid.trim()) return toast.error("Vui lòng nhập định danh!");
+    runningRef.current = true;
     try {
       setBusy(true); setStep(1); setPct(15); setTask("Đang nhúng thủy vân số (DCT)...");
-      const form = new FormData(); form.append("file",file); form.append("watermark_id",wid);
-      const r = await fetch(`${BACKEND_URL}/seal`,{method:"POST",body:form});
+  const form = new FormData(); form.append("file",file); form.append("watermark_id",wid);
+  form.append("registrant_name", registrantName);
+  const r = await fetch(`${BACKEND_URL}/seal`,{method:"POST",body:form});
+      if (r.status === 409) {
+        // Duplicate / derivative detected by backend at seal time
+        const errData = await r.json().catch(()=>({}));
+        const msg = errData.error || "Ảnh này đã được seal hoặc tương tự ảnh đã đăng ký trước đó!";
+        toast.error(`⛔ ${msg}`, { duration: 10000 });
+        setStep(0); setPct(0); setBusy(false); runningRef.current = false;
+        return;
+      }
       if (!r.ok) throw new Error("Lỗi Backend AI");
       const sha  = r.headers.get("X-Image-SHA256");
       const ipfs = r.headers.get("X-IPFS-Link");
@@ -156,29 +193,169 @@ export default function Studio() {
       setPct(40);
 
       setTask("Đang quét trùng lặp...");
-      const vf = new FormData(); vf.append("file",file);
+      // Gửi bản ĐÃ SEAL lên /verify để so sánh đúng với bản trong DB
+      const sealedFile = new File([sealedBlob], "sealed.png", { type: "image/png" });
+      const vf = new FormData(); vf.append("file", sealedFile);
       const vr = await fetch(`${BACKEND_URL}/verify`,{method:"POST",body:vf});
       const vd = await vr.json(); setPct(60);
 
-      let parent = "0x00";
-      if (vd.best_match && vd.best_match.distance<15 && vd.best_match.sha256!==sha) {
-        toast("⚠️ Phát hiện tác phẩm phái sinh.",{icon:"🔗"});
-        parent = vd.best_match.sha256;
+      // Detect derivative / parent using multi-metric result from backend.
+      // Backend now reports matched_by: ['dhash'|'phash'|'ssim'] and clamps distance
+      // to DHASH_THRESHOLD (25) when phash/ssim matched but raw dhash is higher.
+      // Accept a match if:
+      //   (a) distance <= 25  (covers dhash match and clamped phash/ssim match), OR
+      //   (b) matched_by array explicitly contains 'ssim' or 'phash'
+      let parent = "";
+      const bm = vd.best_match;
+
+      // Case 0: SHA khớp hoàn toàn VÀ đã registered on-chain → không cho đăng ký lại
+      if (bm && bm.sha256 === sha && bm.registered === true) {
+        toast.error(
+          `⛔ Tác phẩm này đã được đăng ký bản quyền trước đó (watermark: ${bm.watermark_id || '—'}). Không thể đăng ký lại!`,
+          { duration: 8000 }
+        );
+        setStep(0); setPct(0); setBusy(false); runningRef.current = false;
+        return;
       }
+
+      if (bm && bm.sha256 !== sha) {
+        const byMetric = Array.isArray(bm.matched_by) && bm.matched_by.length > 0;
+        const byDist   = typeof bm.distance === 'number' && bm.distance <= 25;
+        if (byMetric || byDist) {
+          const methods = (bm.matched_by || []).join(', ') || `distance=${bm.distance}`;
+          const ssimPct = bm.ssim_score != null ? ` · SSIM=${(bm.ssim_score*100).toFixed(0)}%` : '';
+          const phashInfo = bm.phash_distance != null ? ` · pHash=${bm.phash_distance}` : '';
+
+          // If the image was also detected as tampered/forged (crop, draw-over, etc.),
+          // block the registration completely — do not allow registering a tampered
+          // derivative as an original or even as a legitimate derivative.
+          if (bm.forgery_image) {
+            toast.error(
+              "⛔ Ảnh bị phát hiện là đã chỉnh sửa / cắt ghép từ tác phẩm đã đăng ký. Không thể đăng ký!",
+              { duration: 8000 }
+            );
+            setStep(0); setPct(0); setBusy(false);
+            return;
+          }
+
+          toast(`🔗 Phát hiện tác phẩm phái sinh! (${methods}${ssimPct}${phashInfo})`,
+                { icon:"⚠️", duration: 5000 });
+          parent = bm.sha256;
+        }
+      }
+
+      // If the image has no derivative match but is still flagged as forged
+      // (e.g. the SHA matched a different record via watermark but pixels are tampered),
+      // also block registration.
+      if (!parent && bm && bm.forgery_image) {
+        toast.error(
+          "⛔ Ảnh bị phát hiện can thiệp / giả mạo. Không thể đăng ký bản quyền!",
+          { duration: 8000 }
+        );
+        setStep(0); setPct(0); setBusy(false);
+        return;
+      }
+
       setSeal({sha,ipfs}); setStep(2); setTask("Gọi Smart Contract...");
+      // Pre-check on-chain and backend to avoid attempting a blockchain tx that will revert
+      try {
+        // 1) check backend DB quickly via /exists (precise)
+        try {
+          const ex = await fetch(`${BACKEND_URL}/exists?sha=${encodeURIComponent(sha)}`).then(r=>r.json()).catch(()=>null);
+          if (ex && ex.exists) {
+            const rec = ex.record || {};
+            console.warn('Duplicate detected in local DB', rec);
+            toast.error(`Lỗi: Tác phẩm đã được đăng ký (CSDL). ${rec.registrant_name?`Người đăng ký: ${rec.registrant_name}. `:''}Định danh: ${rec.watermark_id || '—'}`);
+            setStep(0); setPct(0); setBusy(false);
+            return;
+          }
+        } catch(_) {
+          // ignore
+        }
+
+        // 2) check on-chain via contract view call
+        if (window.ethereum) {
+          const providerCheck = new ethers.BrowserProvider(window.ethereum);
+          const ctCheck = new ethers.Contract(CONTRACT_ADDRESS, abi, providerCheck);
+          try {
+            const rec = await ctCheck.getRecordByHash(sha);
+            // rec.exists (bool) is at index 0 or property exists
+            const existsOnChain = rec && (rec.exists === true || rec[0] === true);
+            if (existsOnChain) {
+              const owner = (rec.owner || rec[1]);
+              toast.error(`Lỗi: Đã tồn tại on-chain (owner ${owner}). Không gửi giao dịch.`);
+              setStep(0); setPct(0); setBusy(false);
+              return;
+            }
+          } catch(_) {
+            // view call failed — ignore and continue (we'll handle revert later)
+          }
+        }
+      } catch(_) {
+        // any network error — we'll still attempt tx but capture revert
+      }
+
       await ensureSepolia(); setPct(75);
       const provider = new ethers.BrowserProvider(window.ethereum);
       const signer  = await provider.getSigner();
       const ct      = new ethers.Contract(CONTRACT_ADDRESS,abi,signer);
       setTask("Xác nhận trên MetaMask...");
-      const tx = await ct.registerCopyright(await signer.getAddress(),sha,wid,parent,ipfs||"");
-      setTask("Ghi khối Sepolia..."); setPct(90);
-      await tx.wait();
+      let tx;
+      try {
+        // If we previously fell back to eth_gasPrice, include a legacy gasPrice override
+        let overrides = {};
+        if (legacyGasHex) {
+          try {
+            overrides = { gasPrice: BigInt(legacyGasHex), type: 0 };
+            console.info("Using legacy gasPrice override for tx");
+          } catch(e) { console.warn("Invalid legacyGasHex, skipping override", e); }
+        }
+        // Build _parentHash as bytes32: zero-hash if no parent, otherwise pad the hex SHA
+        // The contract stores bytes32; a plain SHA-256 hex string (64 chars) maps to 32 bytes.
+        let parentBytes32 = ethers.ZeroHash; // 0x000...000
+        if (parent) {
+          try {
+            // parent is a 64-char hex SHA256; convert to 0x-prefixed bytes32
+            const hex = parent.startsWith('0x') ? parent : '0x' + parent;
+            // Ensure it is exactly 32 bytes (pad if shorter, but SHA256 is always 32 bytes)
+            parentBytes32 = ethers.zeroPadValue(hex, 32);
+          } catch(e) {
+            console.warn('Could not encode parentHash as bytes32, using ZeroHash', e);
+            parentBytes32 = ethers.ZeroHash;
+          }
+        }
+        tx = await ct.registerCopyright(await signer.getAddress(), sha, wid, parentBytes32, ipfs||"", overrides);
+        setTask("Ghi khối Sepolia..."); setPct(90);
+        await tx.wait();
+        // After on-chain confirmation, inform backend so record is marked registered
+        try {
+          const ownerAddr = await signer.getAddress();
+          await fetch(`${BACKEND_URL}/confirm_registration`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sha, tx_hash: tx.hash, owner: ownerAddr, registrant_name: registrantName })
+          });
+          console.info('Confirmed registration to backend', sha, tx.hash);
+        } catch(err) {
+          console.warn('Failed to confirm registration to backend', err);
+        }
+      } catch(innerE) {
+        // Try to surface a clearer revert reason when present
+        const msg = innerE?.reason || innerE?.error?.message || innerE?.message || '';
+        // Some providers include 'execution reverted: <reason>' inside data
+        const m = (msg || '').toString().match(/execution reverted[:\s]*"?([^"\n]*)"?/i);
+        const reason = m ? m[1] : msg;
+        toast.error(reason || "Giao dịch bị revert (xem console)");
+        console.error("tx failed:", innerE);
+        setStep(0); setPct(0);
+        setBusy(false);
+        return;
+      }
       setTxHash(tx.hash); setStep(3); setPct(100); setTask("Hoàn tất!");
       toast.success("🎉 Đăng ký bản quyền thành công!");
     } catch(e) {
       toast.error(e.message||"Lỗi không xác định"); setStep(0); setPct(0);
-    } finally { setBusy(false); }
+    } finally { setBusy(false); runningRef.current = false; }
   };
 
   const p1 = step>1?100:step===1?pct:0;
@@ -319,7 +496,13 @@ export default function Studio() {
               </div>
             </div>
 
-            <label style={C.label}>Định danh tác giả</label>
+            <label style={C.label}>Họ và tên người đăng ký</label>
+            <input style={C.input} type="text" value={registrantName}
+              onChange={e=>setRegistrantName(e.target.value)}
+              disabled={busy||step===3}
+              placeholder="Ví dụ: Nguyễn Văn A"/>
+
+            <label style={{...C.label,marginTop:12}}>Định danh tác giả (watermark id)</label>
             <input style={C.input} type="text" value={wid}
               onChange={e=>setWid(e.target.value)}
               disabled={busy||step===3}

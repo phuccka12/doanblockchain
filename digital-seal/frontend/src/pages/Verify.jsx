@@ -45,7 +45,12 @@ export default function Verify() {
           const ct=new ethers.Contract(CONTRACT_ADDRESS,abi,p);
           if(data.sha256){
             const rv=await ct.getRecordByHash(data.sha256);
-            if(rv&&rv.author&&rv.author!=="0x0000000000000000000000000000000000000000") rec=rv;
+            // ABI returns: (exists, owner, watermarkId, parentHash, timestamp)
+            const existsOnChain = rv && (rv.exists === true || rv[0] === true);
+            const ownerAddr = rv && (rv.owner || rv[1]);
+            if(existsOnChain && ownerAddr && ownerAddr !== "0x0000000000000000000000000000000000000000") {
+              rec = rv;
+            }
           }
         }
       } catch(_){}
@@ -56,9 +61,46 @@ export default function Verify() {
 
   const getVerdict = ()=>{
     if(!result) return "unknown";
-    const d=result.best_match?.distance;
-    if(d==null) return "unknown";
-    if(d<=5) return "authentic"; if(d<=20) return "suspicious"; return "forged";
+    const bm = result.best_match;
+    const d  = bm?.distance;
+
+    // No match in DB at all → unknown
+    if(d == null || !bm) return "unknown";
+
+    // AI detected visual tampering (drawing, signature, crop, etc.) → always "forged"
+    // regardless of hash distance — a signed/edited copy of a registered image is forgery.
+    if(bm?.forgery_image) return "forged";
+
+    // Exact or near-exact match (distance ≤ 5) AND no tampering → authentic original
+    if(d <= 5){
+      if(chain) return "authentic";          // on-chain confirmed ✅
+      if(bm?.registered) return "authentic"; // DB says registered (wallet not connected)
+      return "suspicious";                   // In DB but not yet confirmed on-chain
+    }
+
+    // Similar image detected (derivative / partial match)
+    if(d <= 20) return "suspicious";
+
+    // Distance > 20 but matched by some metric
+    return "suspicious";
+  };
+
+  // Extra context label shown below the verdict
+  const getVerdictSub = ()=>{
+    if(!result) return null;
+    const bm = result.best_match;
+    const d  = bm?.distance;
+    if(d == null || !bm) return "Không tìm thấy ảnh tương tự trong CSDL.";
+    if(bm?.forgery_image){
+      if(d <= 5) return "Ảnh khớp gần như chính xác với bản gốc NHƯNG bị phát hiện có vùng chỉnh sửa (chữ ký, vẽ thêm, cắt ghép). Đây là bản giả mạo.";
+      return `Phát hiện vùng bị can thiệp/chỉnh sửa. Ảnh tương tự bản đã đăng ký (${d} bit).`;
+    }
+    if(d <= 5){
+      if(chain || bm?.registered) return "Ảnh khớp chính xác với bản gốc đã đăng ký bản quyền.";
+      return "Ảnh khớp trong CSDL nhưng chưa xác nhận trên blockchain.";
+    }
+    if(d <= 20) return `Ảnh tương tự ảnh đã đăng ký (khoảng cách ${d} bit). Có thể là tác phẩm phái sinh hoặc bản sao.`;
+    return `Ảnh có nét tương đồng với bản đã đăng ký (khoảng cách ${d} bit). Cần kiểm tra thêm.`;
   };
   const vd = VERDICT[getVerdict()];
 
@@ -167,13 +209,25 @@ export default function Verify() {
                 ))}
               </div>
 
-              {result.watermark_id_extracted&&(
+              {result.watermark_id_extracted && (
                 <div style={{marginBottom:16,padding:"10px 14px",borderRadius:10,
                              background:"rgba(99,102,241,.08)",border:"1px solid rgba(99,102,241,.2)"}}>
-                  <span style={{fontSize:11,color:"#64748b",fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase"}}>
-                    Thủy vân trích xuất:{" "}
-                  </span>
-                  <span style={{fontSize:13,color:"#a5b4fc",fontWeight:600}}>{result.watermark_id_extracted}</span>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                    <div>
+                      <span style={{fontSize:11,color:"#64748b",fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase"}}>
+                        Thủy vân trích xuất:
+                      </span>
+                      <div style={{fontSize:13,color:"#a5b4fc",fontWeight:600,marginTop:6}}>{result.watermark_id_extracted || "—"}</div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      {typeof result.watermark_confidence === 'number' && (
+                        <div style={{fontSize:12,color:"#94a3b8"}}>Độ tin cậy: <strong style={{color:"#fff"}}>{result.watermark_confidence}%</strong></div>
+                      )}
+                      {result.watermark_raw_preview && result.watermark_confidence < 80 && (
+                        <div style={{fontSize:11,color:"#64748b",marginTop:6}}>Raw: <span style={{color:"#c4b5fd"}}>{result.watermark_raw_preview}</span></div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -192,18 +246,32 @@ export default function Verify() {
               {result.best_match?.forgery_image&&(
                 <div>
                   <p style={{fontSize:12,color:"#f87171",fontWeight:700,marginBottom:10}}>
-                    🚨 ELA phát hiện vùng bị can thiệp (khung đỏ):
+                    🚨 Phát hiện vùng bị can thiệp (khung đỏ/cam):
                   </p>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                    {/* LEFT: ảnh GỐC trong DB, có đánh dấu vùng crop (nếu là crop) hoặc thumbnail sạch */}
                     <div>
-                      <p style={{fontSize:11,color:"#64748b",marginBottom:6,textAlign:"center"}}>Ảnh gốc</p>
-                      <img src={preview} alt="original"
-                           style={{width:"100%",borderRadius:10,border:"1px solid rgba(255,255,255,.1)"}}/>
+                      <p style={{fontSize:11,color:"#64748b",marginBottom:6,textAlign:"center"}}>
+                        Ảnh gốc (trong DB) — vùng bị cắt
+                      </p>
+                      <img
+                        src={
+                          result.best_match.forgery_original
+                            ? `data:image/png;base64,${result.best_match.forgery_original}`
+                            : result.best_match.db_thumbnail
+                              ? `data:image/jpeg;base64,${result.best_match.db_thumbnail}`
+                              : `${BACKEND_URL}/thumbnail?sha=${result.best_match.sha256}&size=480`
+                        }
+                        alt="original"
+                        style={{width:"100%",borderRadius:10,border:"1px solid rgba(255,255,255,.1)"}}/>
                     </div>
+                    {/* RIGHT: ảnh UPLOAD (ảnh nghi vấn đã bị cắt/vẽ), có annotation */}
                     <div>
-                      <p style={{fontSize:11,color:"#f87171",marginBottom:6,textAlign:"center"}}>Phân tích ELA</p>
+                      <p style={{fontSize:11,color:"#f87171",marginBottom:6,textAlign:"center"}}>
+                        Ảnh upload — vùng bị thay đổi
+                      </p>
                       <img src={`data:image/png;base64,${result.best_match.forgery_image}`}
-                           alt="ELA"
+                           alt="annotated upload"
                            style={{width:"100%",borderRadius:10,border:"1px solid rgba(239,68,68,.3)"}}/>
                     </div>
                   </div>
@@ -223,8 +291,13 @@ export default function Verify() {
               <p style={{fontSize:16,fontWeight:800,color:vd.color,margin:0}}>{vd.label}</p>
             </div>
             {result?.best_match&&(
-              <p style={{fontSize:12,color:"#64748b",margin:0}}>
+              <p style={{fontSize:12,color:"#64748b",margin:"0 0 8px"}}>
                 Hamming: <strong style={{color:"#fff"}}>{result.best_match.distance} bit</strong> / 256 bit
+              </p>
+            )}
+            {getVerdictSub()&&(
+              <p style={{fontSize:12,color:"#94a3b8",margin:0,lineHeight:1.6}}>
+                {getVerdictSub()}
               </p>
             )}
           </div>

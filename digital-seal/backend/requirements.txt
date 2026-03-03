@@ -6,3 +6,7 @@ ImageHash
 Pillow
 python-multipart
 requests
+reedsolo
+
+# Structural similarity (SSIM) used for robust crop/derivative detection
+scikit-image
