@@ -7,6 +7,6 @@ Pillow
 python-multipart
 requests
 reedsolo
-
+requests
 # Structural similarity (SSIM) used for robust crop/derivative detection
 scikit-image

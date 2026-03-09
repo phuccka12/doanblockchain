@@ -227,9 +227,10 @@ export default function Explorer() {
                     <div style={s.thumb(c)}>
                       {n.sha256 ? (
                         <img
-                          src={`${BACKEND_URL}/thumbnail?sha=${encodeURIComponent(n.sha256)}&size=480`}
+                          src={n.ipfs_link || `${BACKEND_URL}/thumbnail?sha=${encodeURIComponent(n.sha256)}&size=480`}
                           alt={n.watermark_id || 'thumb'}
                           style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                          onError={e => { if (n.ipfs_link && !e.currentTarget.src.includes('thumbnail')) e.currentTarget.src = `${BACKEND_URL}/thumbnail?sha=${encodeURIComponent(n.sha256)}&size=480`; }}
                         />
                       ) : (
                         '🖼️'
@@ -299,7 +300,9 @@ export default function Explorer() {
                     provChain.map((node,i) => {
                       const active = node.sha256 === sel.sha256;
                       const localRec = records.find(r => r.sha256 === node.sha256);
-                      const thumb = localRec ? `${BACKEND_URL}/thumbnail?sha=${encodeURIComponent(node.sha256)}&size=320` : null;
+                      const thumb = localRec
+                        ? (localRec.ipfs_link || `${BACKEND_URL}/thumbnail?sha=${encodeURIComponent(node.sha256)}&size=320`)
+                        : null;
                       return (
                         <div key={node.sha256||i} style={{display:'flex',alignItems:'center',gap:8}}>
                           <button onClick={() => {

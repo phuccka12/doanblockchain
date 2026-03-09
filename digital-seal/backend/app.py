@@ -49,7 +49,8 @@ def db_init():
             registrant_age INTEGER DEFAULT NULL,
             registered INTEGER DEFAULT 0,
             tx_hash TEXT DEFAULT '',
-            owner TEXT DEFAULT ''
+            owner TEXT DEFAULT '',
+            ipfs_link TEXT DEFAULT ''
         )
         """)
         # Ensure columns exist for older DBs (migration)
@@ -83,6 +84,11 @@ def db_init():
         if 'registrant_age' not in cols:
             try:
                 con.execute("ALTER TABLE sealed_records ADD COLUMN registrant_age INTEGER DEFAULT NULL")
+            except Exception:
+                pass
+        if 'ipfs_link' not in cols:
+            try:
+                con.execute("ALTER TABLE sealed_records ADD COLUMN ipfs_link TEXT DEFAULT ''")
             except Exception:
                 pass
         # Alerts table for recording AI-detected issues
@@ -482,8 +488,8 @@ async def seal(file: UploadFile = File(...), watermark_id: str = Form(...), regi
     try:
         with db_conn() as con:
             con.execute(
-                "INSERT OR REPLACE INTO sealed_records (sha256, dhash, orig_dhash, watermark_id, created_at, original_blob, registrant_name, registrant_age, registered, tx_hash, owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (image_hash, dhash_str, orig_dhash or '', watermark_id, int(time.time()), sealed_bytes, registrant_name or '', registrant_age, 0, '', '')
+                "INSERT OR REPLACE INTO sealed_records (sha256, dhash, orig_dhash, watermark_id, created_at, original_blob, registrant_name, registrant_age, registered, tx_hash, owner, ipfs_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (image_hash, dhash_str, orig_dhash or '', watermark_id, int(time.time()), sealed_bytes, registrant_name or '', registrant_age, 0, '', '', ipfs_link or '')
             )
             con.commit()
     except Exception as e:
@@ -975,7 +981,7 @@ def get_records(limit: int = 20, registered_only: bool = False):
         limit_clause = f"LIMIT {int(limit)}" if limit and limit > 0 else ""
         try:
             rows = con.execute(
-                f"SELECT sha256, dhash, watermark_id, created_at, registrant_name, registrant_age, registered, tx_hash, owner "
+                f"SELECT sha256, dhash, watermark_id, created_at, registrant_name, registrant_age, registered, tx_hash, owner, ipfs_link "
                 f"FROM sealed_records {where} ORDER BY created_at DESC {limit_clause}"
             ).fetchall()
         except Exception:
@@ -1007,6 +1013,7 @@ def get_records(limit: int = 20, registered_only: bool = False):
             rec["registered"] = False
             rec["tx_hash"] = ""
             rec["owner"] = ""
+        rec["ipfs_link"] = r[9] if len(r) >= 10 else ""
         records.append(rec)
 
     return JSONResponse({"total": total, "registered_total": registered_total, "records": records})
@@ -1101,3 +1108,76 @@ def get_alerts(limit: int = 10):
 
     return JSONResponse({"alerts": alerts})
 
+
+@app.get("/my-assets")
+def my_assets(owner: str):
+    """Return wallet-centric asset stats for a given owner address.
+
+    Returns:
+      - nft_count: number of NFTs registered on-chain owned by this address
+      - original_count: works with no parent/derivative link (orig_dhash is empty)
+      - derivative_count: works with a parent link
+      - protection_events: AI forgery alerts triggered for works owned by this address
+      - original_score: percentage of owned works that are originals (0-100)
+      - records: full list of owned records (with ipfs_link, sha256, etc.)
+    """
+    if not owner:
+        return JSONResponse({"error": "owner parameter required"}, status_code=400)
+    addr = owner.lower().strip()
+    try:
+        with db_conn() as con:
+            rows = con.execute(
+                "SELECT sha256, dhash, watermark_id, created_at, registrant_name, registrant_age, "
+                "registered, tx_hash, owner, orig_dhash, ipfs_link "
+                "FROM sealed_records WHERE registered = 1 AND lower(owner) = ?",
+                (addr,)
+            ).fetchall()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    records = []
+    sha_list = []
+    for r in rows:
+        sha_list.append(r[0])
+        records.append({
+            "sha256":          r[0],
+            "dhash":           r[1],
+            "watermark_id":    r[2],
+            "created_at":      r[3],
+            "registrant_name": r[4] or "",
+            "registrant_age":  r[5],
+            "registered":      bool(r[6]),
+            "tx_hash":         r[7] or "",
+            "owner":           r[8] or "",
+            "orig_dhash":      r[9] or "",
+            "ipfs_link":       r[10] or "",
+        })
+
+    # Count AI protection events for this owner's works
+    protection_events = 0
+    if sha_list:
+        try:
+            with db_conn() as con:
+                placeholders = ",".join("?" * len(sha_list))
+                protection_events = con.execute(
+                    f"SELECT COUNT(*) FROM alerts WHERE record_sha IN ({placeholders})",
+                    sha_list
+                ).fetchone()[0]
+        except Exception:
+            protection_events = 0
+
+    nft_count       = len(records)
+    # Original = no parent derivative link (orig_dhash empty means user uploaded a fresh image)
+    original_count  = sum(1 for r in records if not r["orig_dhash"])
+    derivative_count = nft_count - original_count
+    original_score  = round((original_count / nft_count * 100) if nft_count > 0 else 0)
+
+    return JSONResponse({
+        "owner":             addr,
+        "nft_count":         nft_count,
+        "original_count":    original_count,
+        "derivative_count":  derivative_count,
+        "protection_events": protection_events,
+        "original_score":    original_score,
+        "records":           records,
+    })
