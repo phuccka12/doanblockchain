@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard';
 import Studio from './pages/Studio';
 import Verify from './pages/Verify';
 import Explorer from './pages/Explorer';
+import Provenance from './pages/Provenance';
 
 export default function App() {
   return (
@@ -19,6 +20,7 @@ export default function App() {
             <Route path="/studio" element={<Studio />} />
             <Route path="/verify" element={<Verify />} />
             <Route path="/explorer" element={<Explorer />} />
+            <Route path="/provenance" element={<Provenance />} />
           </Routes>
         </main>
         <Toaster

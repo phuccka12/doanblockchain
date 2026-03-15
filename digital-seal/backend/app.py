@@ -1,7 +1,8 @@
 import sqlite3
 import time
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import Response, JSONResponse
+import os
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import JSONResponse, FileResponse, Response
 import numpy as np
 import cv2
 import hashlib
@@ -15,8 +16,25 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from reedsolo import RSCodec, ReedSolomonError
 from skimage.metrics import structural_similarity as ssim
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+# Ethereum wallet signature verification
+try:
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+    ETH_ACCOUNT_AVAILABLE = True
+except ImportError:
+    ETH_ACCOUNT_AVAILABLE = False
+    print("[WARN] eth-account not installed. Wallet signature verification disabled.")
+
+# Initialize Limiter
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(title="TrustLens - Hệ thống Bảo vệ Bản quyền (Blockchain & AI)")
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 origins = ["*"]
 app.add_middleware(
@@ -29,8 +47,38 @@ app.add_middleware(
 )
 
 DB_PATH = "seal.db"
-PINATA_API_KEY = "YOUR_PINATA_KEY" 
-PINATA_SECRET_API_KEY = "YOUR_SECRET_KEY"
+PINATA_API_KEY = "4cdf5c25d77c65fdfc40"
+PINATA_SECRET_API_KEY = "4203655197473df22420c5e392ef564accffebc0cf5fa07d8812cb1ea0caf1a9"  # ← cần thêm Secret API Key từ Pinata dashboard
+
+
+# ── Blockchain config ─────────────────────────────────────────────────────────
+# Public Sepolia JSON-RPC (không cần API key)
+SEPOLIA_RPC_URL    = "https://ethereum-sepolia.blockpi.network/v1/rpc/public"
+CONTRACT_ADDRESS   = "0x393eC4498280cB0F75e0edd1e1AE0cc7F3bD3711"
+# Function selector: keccak256("getRecordByHash(string)")[:4]
+# Verified bằng: from eth_hash.auto import keccak; keccak(b"getRecordByHash(string)").hex()[:8]
+FUNC_SELECTOR_GET_RECORD = "cb8370b8"
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def verify_wallet_signature(wallet_address: str, message: str, signature: str) -> bool:
+    """Xác minh chữ ký MetaMask (personal_sign / eth_sign).
+
+    MetaMask dùng `personal_sign` — có prefix: "\x19Ethereum Signed Message:\n{len}"
+    Điều này tương đương với EIP-191.
+
+    Returns True nếu signer khớp với wallet_address, False nếu không khớp hoặc lỗi.
+    """
+    if not ETH_ACCOUNT_AVAILABLE:
+        print("[WARN] eth-account không có — bỏ qua xác minh chữ ký")
+        return True  # fallback: không chặn nếu thư viện chưa cài
+    try:
+        msg = encode_defunct(text=message)
+        recovered = Account.recover_message(msg, signature=signature)
+        return recovered.lower() == wallet_address.lower()
+    except Exception as e:
+        print(f"[WALLET-SIG] verify error: {e}")
+        return False
 
 def db_conn():
     return sqlite3.connect(DB_PATH)
@@ -91,6 +139,12 @@ def db_init():
                 con.execute("ALTER TABLE sealed_records ADD COLUMN ipfs_link TEXT DEFAULT ''")
             except Exception:
                 pass
+        if 'parent_hash' not in cols:
+            try:
+                con.execute("ALTER TABLE sealed_records ADD COLUMN parent_hash TEXT DEFAULT ''")
+            except Exception:
+                pass
+
         # Alerts table for recording AI-detected issues
         con.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
@@ -116,29 +170,107 @@ def calc_dhash(image_bytes: bytes) -> str:
 def hamming_distance(s1: str, s2: str) -> int:
     return sum(c1 != c2 for c1, c2 in zip(s1, s2))
 
-def upload_to_ipfs(file_bytes):
-    if "YOUR" in PINATA_API_KEY: return None
-    url = "https://api.pinata.cloud/pinning/pinFileToIPFS"
-    headers = {"pinata_api_key": PINATA_API_KEY, "pinata_secret_api_key": PINATA_SECRET_API_KEY}
-    files = {'file': ('image.png', file_bytes)}
+def upload_to_ipfs(file_bytes: bytes, watermark_id: str = "", sha256_hex: str = "", registrant_name: str = "") -> str | None:
+    """Upload ảnh và metadata JSON lên IPFS qua Pinata.
+
+    Flow chuẩn ERC-721:
+      1. Upload ảnh → image_cid
+      2. Tạo metadata JSON { name, description, image: ipfs://{image_cid}, attributes }
+      3. Upload metadata JSON → metadata_cid
+      4. Trả về "ipfs://{metadata_cid}" làm tokenURI cho Smart Contract
+
+    Nếu Pinata chưa cấu hình → trả về None (bỏ qua bước IPFS).
+    """
+    if "YOUR" in PINATA_API_KEY or "YOUR" in PINATA_SECRET_API_KEY:
+        print("[IPFS] Pinata chưa cấu hình – bỏ qua IPFS upload")
+        return None
+
+    headers = {
+        "pinata_api_key":        PINATA_API_KEY,
+        "pinata_secret_api_key": PINATA_SECRET_API_KEY,
+    }
+
     try:
-        res = requests.post(url, files=files, headers=headers)
-        if res.status_code == 200: return f"https://gateway.pinata.cloud/ipfs/{res.json()['IpfsHash']}"
-    except: pass
+        # ── Bước 1: Upload ảnh ──────────────────────────────────────────────
+        res_img = requests.post(
+            "https://api.pinata.cloud/pinning/pinFileToIPFS",
+            files={"file": (f"trustlens_{sha256_hex[:8] or 'image'}.png", file_bytes, "image/png")},
+            headers=headers,
+            timeout=30,
+        )
+        if res_img.status_code != 200:
+            print(f"[IPFS] Upload ảnh thất bại: HTTP {res_img.status_code} – {res_img.text[:120]}")
+            return None
+
+        image_cid = res_img.json()["IpfsHash"]
+        image_ipfs_url = f"ipfs://{image_cid}"
+        print(f"[IPFS] ✅ Ảnh đã upload: {image_ipfs_url}")
+
+        # ── Bước 2: Tạo metadata JSON chuẩn ERC-721 ─────────────────────────
+        import json
+        metadata = {
+            "name":        f"TrustLens – {watermark_id or sha256_hex[:12]}",
+            "description": (
+                f"Tác phẩm được đăng ký bản quyền trên TrustLens "
+                f"(Blockchain + AI Digital Watermarking).\n"
+                f"Người đăng ký: {registrant_name or 'Không rõ'}."
+            ),
+            "image":       image_ipfs_url,
+            "external_url": "https://trustlens.app",
+            "attributes": [
+                {"trait_type": "Watermark ID",    "value": watermark_id or ""},
+                {"trait_type": "SHA-256",         "value": sha256_hex or ""},
+                {"trait_type": "Người đăng ký",  "value": registrant_name or ""},
+                {"trait_type": "Nền tảng",        "value": "TrustLens"},
+            ],
+        }
+        metadata_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+
+        # ── Bước 3: Upload metadata JSON ────────────────────────────────────
+        res_meta = requests.post(
+            "https://api.pinata.cloud/pinning/pinFileToIPFS",
+            files={"file": ("metadata.json", metadata_bytes, "application/json")},
+            headers=headers,
+            timeout=30,
+        )
+        if res_meta.status_code != 200:
+            print(f"[IPFS] Upload metadata thất bại: HTTP {res_meta.status_code} – bỏ qua")
+            # Fallback: trả về link ảnh thay vì metadata
+            return f"https://gateway.pinata.cloud/ipfs/{image_cid}"
+
+        meta_cid = res_meta.json()["IpfsHash"]
+        token_uri = f"ipfs://{meta_cid}"
+        print(f"[IPFS] ✅ Metadata đã upload: {token_uri}")
+        print(f"[IPFS]    Gateway: https://gateway.pinata.cloud/ipfs/{meta_cid}")
+        return token_uri
+
+    except requests.exceptions.Timeout:
+        print("[IPFS] Timeout khi upload lên Pinata")
+    except Exception as e:
+        print(f"[IPFS] Lỗi: {e}")
     return None
+
 
 # ==========================================
 # 2. LÕI KỸ THUẬT: THỦY VÂN TẦN SỐ (DCT) 
 # Chống nén ảnh JPEG, Resize, Cắt xén
 # ==========================================
 Q = 50 # Hệ số lượng tử hóa. Q càng lớn -> Càng khó bị xóa nhưng ảnh gốc hơi nhiễu
+MIN_IMG_SIZE_FOR_WATERMARK = 64  # Kích thước tối thiểu (px) để embed DCT watermark
 
 def embed_dct_blind(img, text_id, rs_nsym: int = 32):
     """Giấu ID bản quyền vào miền tần số DCT với Reed-Solomon ECC.
 
     text_id is encoded as UTF-8 bytes, RS-encoded (nsym parity bytes), then embedded bitwise.
     A 16-bit terminator of '1's is appended to mark the end of the stream.
+    Returns the original image unchanged if it is too small to safely embed a watermark.
     """
+    # Guard: ảnh quá nhỏ không thể chứa đủ DCT coefficients
+    h_img, w_img = img.shape[:2]
+    if h_img < MIN_IMG_SIZE_FOR_WATERMARK or w_img < MIN_IMG_SIZE_FOR_WATERMARK:
+        print(f"[EMBED] Ảnh quá nhỏ ({w_img}x{h_img}) để embed watermark – trả về ảnh gốc.")
+        return img
+
     # Encode with Reed-Solomon to add error-correction parity
     try:
         rs = RSCodec(rs_nsym)
@@ -160,6 +292,11 @@ def embed_dct_blind(img, text_id, rs_nsym: int = 32):
     y, u, v = cv2.split(img_yuv)
 
     y_dct = cv2.dct(np.float32(y))
+
+    # Tính số bit tối đa có thể chứa trên đường chéo (trừ vùng bắt đầu start_idx)
+    max_bits = min(y_dct.shape[0], y_dct.shape[1]) - 20
+    if len(binary_id) > max_bits:
+        print(f"[EMBED] Cảnh báo: watermark ({len(binary_id)} bits) vượt quá dung lượng ({max_bits} bits) – sẽ bị cắt.")
 
     start_idx = 20
     for i, bit in enumerate(binary_id):
@@ -301,7 +438,7 @@ def detect_crop_region(img_upload, img_original):
         result_map = cv2.matchTemplate(gray_orig, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result_map)
 
-        if max_val >= 0.40:
+        if max_val >= 0.62:  # Ngưỡng tin cậy: ≥62% tránh false positive. Trước đây là 0.40 (quá thấp).
             x, y = max_loc
             conf_pct = f"{max_val*100:.0f}%"
 
@@ -330,15 +467,16 @@ def detect_crop_region(img_upload, img_original):
                 # Threshold – 30 catches visible strokes but ignores minor JPEG noise
                 _, diff_thresh = cv2.threshold(diff_gray, 30, 255, cv2.THRESH_BINARY)
 
-                # Clean up tiny noise
-                kernel = np.ones((5, 5), np.uint8)
-                diff_thresh = cv2.morphologyEx(diff_thresh, cv2.MORPH_OPEN,  kernel)
+                # Dùng kernel NHỎ (3×3) + KHÔNG có MORPH_OPEN để giữ nét chữ ký mỏng.
+                # Kernel 5×5 + OPEN sẽ xóa mất các nét vẽ tay mỏng (bút ký, viết tay).
+                # Cùng chiến lược với Strategy 2 (Pixel Diff cho ảnh full-size).
+                kernel = np.ones((3, 3), np.uint8)
                 diff_thresh = cv2.dilate(diff_thresh, kernel, iterations=2)
 
                 contours, _ = cv2.findContours(diff_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 draw_count = 0
                 for cnt in contours:
-                    if cv2.contourArea(cnt) > 150:
+                    if cv2.contourArea(cnt) > 80:  # 80px² bắt được nét bút mỏng (trước: 150)
                         bx, by, bw, bh = cv2.boundingRect(cnt)
                         cv2.rectangle(annotated_upload,
                                       (max(0, bx - 4), max(0, by - 4)),
@@ -402,7 +540,37 @@ def perform_ela(image_bytes, quality=90):
 # 4. API ENDPOINTS
 # ==========================================
 @app.post("/seal")
-async def seal(file: UploadFile = File(...), watermark_id: str = Form(...), registrant_name: str = Form(''), registrant_age: int = Form(None)):
+@limiter.limit("5/minute")
+async def seal(
+    request: Request,
+    file: UploadFile = File(...),
+    watermark_id: str = Form(...),
+    registrant_name: str = Form(''),
+    registrant_age: int = Form(None),
+    # Wallet signature (tùy chọn – bắt buộc khi gọi từ frontend chính thức)
+    wallet_address: str = Form(''),
+    signature: str = Form(''),
+):
+    """Đóng dấu bản quyền DCT và lưu vào DB.
+
+    Nếu wallet_address + signature được cung cấp → xác minh EIP-191 signature trước.
+    Message phải có format: "TrustLens|{watermark_id}|{wallet_address}"
+    Nếu không cung cấp (test local / backwards compat) → bỏ qua kiểm tra.
+    """
+    # ── Xác minh chữ ký MetaMask (nếu có) ────────────────────────────────────
+    if wallet_address and signature:
+        expected_msg = f"TrustLens|{watermark_id}|{wallet_address}"
+        if not verify_wallet_signature(wallet_address, expected_msg, signature):
+            print(f"[SEAL][AUTH] Chữ ký không hợp lệ: wallet={wallet_address} wm={watermark_id}")
+            return JSONResponse(
+                {"error": "Chữ ký ví không hợp lệ. Vui lòng ký lại bằng MetaMask."},
+                status_code=401
+            )
+        print(f"[SEAL][AUTH] ✓ Chữ ký hợp lệ: wallet={wallet_address[:10]}... wm={watermark_id}")
+    else:
+        print(f"[SEAL] Không có chữ ký wallet → tiếp tục (backwards compat / test mode)")
+    # ─────────────────────────────────────────────────────────────────────────
+
     raw = await file.read()
     nparr = np.frombuffer(raw, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -419,10 +587,11 @@ async def seal(file: UploadFile = File(...), watermark_id: str = Form(...), regi
     #   • orig_dhash string       (catches re-upload of the original before sealing)
     # Thresholds are intentionally wider here than in /verify so minor JPEG
     # compression or small crops are still caught at seal time.
-    SEAL_DHASH_TH  = 12   # very tight: same image even after JPEG re-save
-    SEAL_PHASH_TH  = 10
-    SEAL_SSIM_TH   = 0.80  # 80%+ structural similarity → treat as duplicate
-    SEAL_ORIG_DH_TH = 8   # orig_dhash string comparison (pre-watermark)
+    SEAL_DHASH_TH   = 8    # ≤8/64 bits khác nhau → gần như cùng ảnh (trước đây 12, quá rộng)
+    SEAL_PHASH_TH   = 8    # tương tự
+    SEAL_SSIM_TH    = 0.92 # ≥92% cấu trúc giống nhau mới là duplicate (trước đây 0.80, quá thấp)
+    SEAL_ORIG_DH_TH = 4    # orig_dhash: chỉ bắt ảnh gần như y hệt (trước đây 8, gây false positive)
+    # Yêu cầu ít nhất 2/3 metric đồng thuận → tránh false positive từ 1 metric nhiễu
 
     try:
         # Re-encode upload as PNG for fair comparison with stored PNG blobs
@@ -436,18 +605,30 @@ async def seal(file: UploadFile = File(...), watermark_id: str = Form(...), regi
 
         for ex_sha, ex_wm, ex_name, ex_reg, ex_orig_dh, ex_blob in existing:
             # Fast check: compare orig_dhash strings first (very cheap)
+            # Chỉ dùng orig_dhash khi khoảng cách RẤT nhỏ (≤4) để tránh false positive
             if orig_dhash and ex_orig_dh:
                 od = hamming_distance(orig_dhash, ex_orig_dh)
                 if od <= SEAL_ORIG_DH_TH:
+                    # ── Logic mới: nếu record cũ CHƯA lên chain (registered=0)
+                    # → xóa và cho phép seal lại (người dùng cần thử lại luồng)
+                    # → chỉ chặn nếu đã đăng ký on-chain (registered=1)
+                    if not ex_reg:
+                        print(f"[SEAL] Record matched orig_dhash (dist={od}) nhưng registered=0 "
+                              f"→ xóa và cho phép re-seal: sha={ex_sha[:12]}... wm={ex_wm}")
+                        with db_conn() as _del_con:
+                            _del_con.execute("DELETE FROM sealed_records WHERE sha256=?", (ex_sha,))
+                            _del_con.commit()
+                        continue  # cho phép tiếp tục seal
                     owner_info = f"Người đăng ký: {ex_name}. " if ex_name else ""
-                    status = "đã đăng ký on-chain" if ex_reg else "đã được seal"
+                    print(f"[SEAL][DUPLICATE] orig_dhash match: dist={od} vs sha={ex_sha[:12]}... wm={ex_wm}")
                     return JSONResponse(
-                        {"error": f"Ảnh này {status} trước đó ({owner_info}Định danh: {ex_wm}). Không thể seal lại.",
-                         "duplicate_sha": ex_sha, "registered": bool(ex_reg)},
+                        {"error": f"Ảnh này đã đăng ký on-chain ({owner_info}Định danh: {ex_wm}). Không thể seal lại.",
+                         "duplicate_sha": ex_sha, "registered": True},
                         status_code=409
                     )
 
             # Slower check: full metrics against stored blob
+            # Yêu cầu ÍT NHẤT 2/3 metric khớp để tránh false positive từ 1 metric nhiễu
             if ex_blob:
                 try:
                     metrics = compare_two_images_bytes(upload_png_bytes, bytes(ex_blob))
@@ -455,23 +636,43 @@ async def seal(file: UploadFile = File(...), watermark_id: str = Form(...), regi
                     ph = metrics.get('phash_distance')
                     ss = metrics.get('ssim')
 
-                    is_dup = (
-                        (dh is not None and dh <= SEAL_DHASH_TH) or
-                        (ph is not None and ph <= SEAL_PHASH_TH) or
-                        (ss is not None and ss >= SEAL_SSIM_TH)
-                    )
+                    hit_dh = (dh is not None and dh <= SEAL_DHASH_TH)
+                    hit_ph = (ph is not None and ph <= SEAL_PHASH_TH)
+                    hit_ss = (ss is not None and ss >= SEAL_SSIM_TH)
+                    hit_count = sum([hit_dh, hit_ph, hit_ss])
+
+                    # Debug log mọi lúc để chẩn đoán
+                    print(f"[SEAL][CHECK] vs sha={ex_sha[:12]}... dH={dh}({'✓' if hit_dh else '✗'}) "
+                          f"pH={ph}({'✓' if hit_ph else '✗'}) SSIM={round(ss,3) if ss else None}({'✓' if hit_ss else '✗'}) "
+                          f"hits={hit_count}/3")
+
+                    # Cần tối thiểu 2 metric đồng thuận mới báo duplicate
+                    is_dup = (hit_count >= 2)
                     if is_dup:
                         owner_info = f"Người đăng ký: {ex_name}. " if ex_name else ""
-                        status = "đã đăng ký on-chain" if ex_reg else "đã được seal"
+                        matched_metrics = (["dHash" if hit_dh else None,
+                                            "pHash" if hit_ph else None,
+                                            "SSIM"  if hit_ss else None])
+                        matched_metrics = [m for m in matched_metrics if m]
+                        print(f"[SEAL][DUPLICATE] blob match ({', '.join(matched_metrics)}): dH={dh} pH={ph} SSIM={round(ss,3) if ss else None}")
+
+                        # ── Logic mới: nếu record cũ CHƯA lên chain → xóa, cho re-seal ──
+                        if not ex_reg:
+                            print(f"[SEAL] Blob match nhưng registered=0 → xóa và cho phép re-seal: sha={ex_sha[:12]}...")
+                            with db_conn() as _del_con:
+                                _del_con.execute("DELETE FROM sealed_records WHERE sha256=?", (ex_sha,))
+                                _del_con.commit()
+                            continue  # tiếp tục seal mới
+
                         return JSONResponse(
-                            {"error": f"Ảnh tương tự {status} trước đó ({owner_info}Định danh: {ex_wm}). "
-                                      f"dHash={dh} pHash={ph} SSIM={round(ss,2) if ss else None}",
-                             "duplicate_sha": ex_sha, "registered": bool(ex_reg),
+                            {"error": f"Ảnh tương tự đã đăng ký on-chain ({owner_info}Định danh: {ex_wm}). "
+                                      f"Khớp theo: {', '.join(matched_metrics)} – dHash={dh} pHash={ph} SSIM={round(ss,2) if ss else None}",
+                             "duplicate_sha": ex_sha, "registered": True,
                              "metrics": {"dhash": dh, "phash": ph, "ssim": ss}},
                             status_code=409
                         )
-                except Exception:
-                    pass
+                except Exception as _ce:
+                    print(f"[SEAL][CHECK] error comparing vs {ex_sha[:12]}: {_ce}")
     except Exception as guard_err:
         print(f"[SEAL] duplicate guard error: {guard_err}")
     # ─────────────────────────────────────────────────────────────────────────
@@ -483,7 +684,12 @@ async def seal(file: UploadFile = File(...), watermark_id: str = Form(...), regi
     
     image_hash = sha256_hex(sealed_bytes)
     dhash_str = calc_dhash(sealed_bytes)
-    ipfs_link = upload_to_ipfs(sealed_bytes)
+    ipfs_link = upload_to_ipfs(
+        sealed_bytes,
+        watermark_id=watermark_id,
+        sha256_hex=image_hash,
+        registrant_name=registrant_name or '',
+    )
 
     try:
         with db_conn() as con:
@@ -516,26 +722,20 @@ class ConfirmRegistration(BaseModel):
     tx_hash: str
     owner: str | None = None
     registrant_name: str | None = None
+    parent_hash: str | None = None
 
 
 @app.post("/confirm_registration")
 def confirm_registration(item: ConfirmRegistration):
-    """Mark a sealed record as registered on-chain and attach tx/owner info. Optionally update registrant name."""
+    """Mark a sealed record as registered on-chain and attach tx/owner/parent info."""
     try:
         with db_conn() as con:
-            # Update registration fields and optionally registrant_name
-            if item.registrant_name is not None:
-                con.execute(
-                    "UPDATE sealed_records SET registered = 1, tx_hash = ?, owner = ?, registrant_name = ? WHERE sha256 = ?",
-                    (item.tx_hash or '', item.owner or '', item.registrant_name or '', item.sha)
-                )
-            else:
-                con.execute(
-                    "UPDATE sealed_records SET registered = 1, tx_hash = ?, owner = ? WHERE sha256 = ?",
-                    (item.tx_hash or '', item.owner or '', item.sha)
-                )
+            con.execute(
+                "UPDATE sealed_records SET registered = 1, tx_hash = ?, owner = ?, registrant_name = COALESCE(?, registrant_name), parent_hash = COALESCE(?, parent_hash) WHERE sha256 = ?",
+                (item.tx_hash or '', item.owner or '', item.registrant_name, item.parent_hash, item.sha)
+            )
             con.commit()
-        print(f"[CONFIRM] sha={item.sha} tx={item.tx_hash} owner={item.owner} registrant_name={item.registrant_name}")
+        print(f"[CONFIRM] sha={item.sha} tx={item.tx_hash} owner={item.owner} parent={item.parent_hash}")
         return JSONResponse({"ok": True})
     except Exception as e:
         print("[CONFIRM] error:", e)
@@ -604,12 +804,12 @@ def process_verification(raw_bytes):
             watermark_confidence = None
             watermark_raw_preview = None
 
-    # thresholds for multi-metric matching
-    # Wider than the /compare endpoint so JPEG-compressed or lightly-cropped
-    # derivatives are still detected as related works.
-    DHASH_THRESHOLD = 30   # was 25 — catches minor JPEG noise & slight crop
-    PHASH_THRESHOLD = 15   # was 12
-    SSIM_THRESHOLD  = 0.40 # was 0.45 — lower = easier to match (more sensitive)
+    # Ngưỡng phát hiện ảnh derivative/giả mạo.
+    # Tighten để giảm false positive: cần ≥2/3 metric đồng thuận mới báo là match.
+    DHASH_THRESHOLD = 20   # ≤20/64 bit khác = 69% giống trở lên (trước: 30, quá rộng)
+    PHASH_THRESHOLD = 12   # tương đương
+    SSIM_THRESHOLD  = 0.55 # ≥55% cấu trúc (trước: 0.40, quá thấp → false positive)
+    # Yêu cầu ít nhất 2/3 metric khớp mới xem là candidate liên quan
 
     best_match = None
 
@@ -662,13 +862,36 @@ def process_verification(raw_bytes):
                 except Exception:
                     pass
 
+            hit_dh_v = (dhash_dist is not None and dhash_dist <= DHASH_THRESHOLD)
+            hit_ph_v = (phash_dist is not None and phash_dist <= PHASH_THRESHOLD)
+            hit_ss_v = (ssim_score is not None and ssim_score >= SSIM_THRESHOLD)
+            hit_count_v = sum([hit_dh_v, hit_ph_v, hit_ss_v])
+
+            # ── pHash Guard ──────────────────────────────────────────────────────
+            # dHash và SSIM đều cho kết quả ÂM SAI DƯƠNG trên ảnh uniform/smooth:
+            #   - dHash chỉ đo gradient ngang → ảnh nào đồng nhất theo chiều ngang đều cho dist ≈ 0
+            #   - SSIM cao khi variance ≈ 0 (ảnh ít texture) → metric không đáng tin
+            # pHash dùng biến đổi tần số (DCT) nhiều hướng → đáng tin hơn.
+            # Guard: nếu pHash cho thấy 2 ảnh RẤT khác nhau (dist > 20) nhưng
+            # dHash + SSIM vẫn match → hạ số hit về 1 (không đủ để match).
+            PHASH_UNRELIABLE_GUARD = 20  # pHash khoảng cách > này → ảnh khác hẳn
+            if (hit_count_v >= 2 and not hit_ph_v
+                    and phash_dist is not None and phash_dist > PHASH_UNRELIABLE_GUARD):
+                print(f"[VERIFY][PHASH-GUARD] pHash dist={phash_dist} > {PHASH_UNRELIABLE_GUARD} "
+                      f"→ dHash+SSIM unreliable on uniform image, demoting to 1 hit")
+                hit_count_v = 1  # cần cả 3 metric khi pHash chênh lớn
+
+            # Debug log
+            print(f"[VERIFY][CHECK] vs sha={db_sha[:12]}... dH={dhash_dist}({'✓' if hit_dh_v else '✗'}) "
+                  f"pH={phash_dist}({'✓' if hit_ph_v else '✗'}) SSIM={round(ssim_score,3) if ssim_score else None}({'✓' if hit_ss_v else '✗'}) "
+                  f"hits={hit_count_v}/3")
+
             matched_by = []
-            if dhash_dist is not None and dhash_dist <= DHASH_THRESHOLD:
-                matched_by.append('dhash')
-            if phash_dist is not None and phash_dist <= PHASH_THRESHOLD:
-                matched_by.append('phash')
-            if ssim_score is not None and ssim_score >= SSIM_THRESHOLD:
-                matched_by.append('ssim')
+            # Cần ≥2 metric đồng thuận (sau pHash guard) mới là candidate hợp lệ
+            if hit_count_v >= 2:
+                if hit_dh_v: matched_by.append('dhash')
+                if hit_ph_v: matched_by.append('phash')
+                if hit_ss_v: matched_by.append('ssim')
 
             candidates.append({
                 'sha': db_sha,
@@ -690,7 +913,67 @@ def process_verification(raw_bytes):
         # We want descending score_count, descending ssim, ascending phash, ascending dhash
         return (-score_count, -ssim_val, phash_val, dhash_val)
 
+    # ── Fallback: Template Matching cho ảnh bị crop nặng ────────────────────
+    # Ảnh bị crop nhiều sẽ có dHash/pHash/SSIM rất khác gốc → không qua được
+    # ngưỡng metric. Template matching không bị ảnh hưởng bởi crop vì nó tìm
+    # vùng con bên trong ảnh gốc. Chạy pass này SAU khi metric pass không tìm ra.
+    #
+    # Cách hoạt động: với mỗi record trong DB lớn hơn ảnh upload, dùng OpenCV
+    # matchTemplate để kiểm tra ảnh upload có phải crop của record đó không.
+    # Nếu match ≥ 50% confidence → thêm vào candidates với matched_by=['crop'].
+    metric_candidates_found = [c for c in candidates if c.get('matched_by')]
+    if not metric_candidates_found:
+        print("[VERIFY][CROP-FALLBACK] Không tìm thấy candidate bằng metrics → thử template matching...")
+        for row in rows:
+            db_sha_t, _, _, db_wm_t, db_blob_t, db_reg_t = row
+            if not db_blob_t:
+                continue
+            try:
+                nparr_t = np.frombuffer(db_blob_t, np.uint8)
+                img_db_t = cv2.imdecode(nparr_t, cv2.IMREAD_COLOR)
+                if img_db_t is None:
+                    continue
+
+                h_up, w_up = img_upload.shape[:2]
+                h_db, w_db = img_db_t.shape[:2]
+
+                # Chỉ chạy nếu ảnh upload NHỎ HƠN record (điều kiện cần của crop)
+                if w_up >= w_db or h_up >= h_db:
+                    continue
+
+                # Template matching trên grayscale
+                gray_db = cv2.cvtColor(img_db_t, cv2.COLOR_BGR2GRAY)
+                gray_up = cv2.cvtColor(img_upload, cv2.COLOR_BGR2GRAY)
+
+                # Scale template nếu cần (template phải ≤ source)
+                tw, th = w_up, h_up
+                template = gray_up
+                if tw > w_db or th > h_db:
+                    scale = min(w_db / tw, h_db / th) * 0.95
+                    tw, th = int(tw * scale), int(th * scale)
+                    template = cv2.resize(gray_up, (tw, th), interpolation=cv2.INTER_AREA)
+
+                result_map = cv2.matchTemplate(gray_db, template, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result_map)
+
+                print(f"[VERIFY][CROP-FALLBACK] vs sha={db_sha_t[:12]}... template_conf={max_val:.3f}")
+                if max_val >= 0.50:  # 50% đủ để là crop candidate khi no metric match
+                    candidates.append({
+                        'sha': db_sha_t,
+                        'dhash': None,
+                        'phash': None,
+                        'ssim': float(max_val),  # dùng template confidence thay ssim
+                        'watermark_id': db_wm_t,
+                        'blob': db_blob_t,
+                        'matched_by': ['crop'],
+                        'registered': bool(db_reg_t),
+                    })
+                    print(f"[VERIFY][CROP-FALLBACK] ✓ Crop candidate added: wm={db_wm_t} conf={max_val:.3f}")
+            except Exception as _te:
+                print(f"[VERIFY][CROP-FALLBACK] error: {_te}")
+
     candidates = [c for c in candidates if c.get('matched_by')]
+
     if candidates:
         candidates.sort(key=rank_key)
         best = candidates[0]
@@ -744,11 +1027,12 @@ def process_verification(raw_bytes):
             # lossless compression) produces random high-amplitude differences that
             # look like forgeries even on untouched images.  Skip ELA for PNG.
             if not is_forged:
+                # Kiểm tra định dạng ảnh bằng magic bytes (thay thế imghdr bị deprecated từ Python 3.11+
+                # và bị xóa hoàn toàn trong Python 3.13)
                 try:
-                    import imghdr as _imghdr
-                    _fmt = _imghdr.what(None, h=raw_bytes[:32])
+                    _fmt = 'png' if raw_bytes[:4] == b'\x89PNG' else 'jpeg'
                 except Exception:
-                    _fmt = None
+                    _fmt = 'jpeg'  # fallback: chạy ELA
                 if _fmt != 'png':
                     is_forged, img_result = perform_ela(raw_bytes)
 
@@ -1181,3 +1465,208 @@ def my_assets(owner: str):
         "original_score":    original_score,
         "records":           records,
     })
+
+
+# ============================================================
+# ON-CHAIN CHECK  (g\u1ecdi Sepolia JSON-RPC, kh\u00f4ng c\u1ea7n ethers.js)
+# ============================================================
+
+def _abi_encode_string(s: str) -> str:
+    """ABI-encode m\u1ed9t string argument (t\u01b0\u01a1ng \u0111\u01b0\u01a1ng abi.encode(string)).
+
+    Format:
+      offset (32 bytes)   \u2013 v\u1ecb tr\u00ed b\u1eaft \u0111\u1ea7u c\u1ee7a string data (= 32)
+      length (32 bytes)   \u2013 s\u1ed1 byte c\u1ee7a string
+      data   (\u00d7 32-byte)  \u2013 UTF-8 bytes padding ph\u1ea3i \u0111\u1ebfn b\u1ed9i 32
+
+    Return: hex string (kh\u00f4ng c\u00f3 0x prefix), \u0111\u1ed3ng b\u1ed9 v\u1edbi calldata sau selector.
+    """
+    encoded_bytes = s.encode('utf-8')
+    length = len(encoded_bytes)
+    padded_len = ((length + 31) // 32) * 32      # l\u00e0m tr\u00f2n l\u00ean b\u1ed9i 32
+
+    offset_hex = format(32, '064x')               # offset = 32 (always)
+    length_hex = format(length, '064x')
+    data_hex   = encoded_bytes.hex().ljust(padded_len * 2, '0')
+
+    return offset_hex + length_hex + data_hex
+
+
+def _abi_decode_string(hex_data: str, offset: int) -> str:
+    """Decode m\u1ed9t ABI-encoded dynamic string t\u1ea1i v\u1ecb tr\u00ed offset trong hex_data."""
+    try:
+        # \u0110\u1ecdc offset con tr\u1ecf (th\u01b0\u1eddng l\u00e0 vị trí b\u1eaft \u0111\u1ea7u c\u1ee7a string block t\u00ednh t\u1eeb byte0)
+        ptr = int(hex_data[offset*2: offset*2 + 64], 16)
+        length = int(hex_data[ptr*2: ptr*2 + 64], 16)
+        data_start = (ptr + 32) * 2
+        raw = bytes.fromhex(hex_data[data_start: data_start + length * 2])
+        return raw.decode('utf-8', errors='replace')
+    except Exception:
+        return ""
+
+
+@app.get("/onchain-check")
+def onchain_check(sha: str):
+    """G\u1ecdi smart contract `getRecordByHash(sha256_hex)` tr\u00ean Sepolia qua JSON-RPC.
+
+    Tr\u1ea3 v\u1ec1:
+      - exists (bool)
+      - owner  (address string)
+      - watermark_id (string)
+      - parent_hash  (string)
+      - timestamp    (int)
+      - etherscan_url (string link \u0111\u1ebfn token)
+
+    Kh\u00f4ng c\u1ea7n ethers.js hay web3 \u2014 ch\u1ec9 d\u00f9ng requests + ABI encode th\u1ee7 c\u00f4ng.
+    """
+    if not sha:
+        return JSONResponse({"error": "sha parameter required"}, status_code=400)
+
+    try:
+        # ABI-encode calldata = selector + encoded string argument
+        calldata = "0x" + FUNC_SELECTOR_GET_RECORD + _abi_encode_string(sha)
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method":  "eth_call",
+            "params":  [
+                {"to": CONTRACT_ADDRESS, "data": calldata},
+                "latest"
+            ],
+            "id": 1
+        }
+        resp = requests.post(SEPOLIA_RPC_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        rpc_result = resp.json()
+
+        if "error" in rpc_result:
+            return JSONResponse({"error": rpc_result["error"].get("message", "RPC error")}, status_code=502)
+
+        raw_hex = rpc_result.get("result", "0x")
+        if not raw_hex or raw_hex == "0x":
+            return JSONResponse({"exists": False, "owner": None, "watermark_id": None,
+                                 "parent_hash": None, "timestamp": None})
+
+        # X\u00f3a prefix 0x
+        hex_data = raw_hex[2:]
+
+        # ABI decode: (bool exists, address owner, string watermarkId, string parentHash, uint256 timestamp)
+        # Word 0 (bytes 0-31)  : bool exists
+        # Word 1 (bytes 32-63) : address owner (20 bytes, right-padded to 32)
+        # Word 2 (bytes 64-95) : offset \u0111\u1ebfn watermarkId string
+        # Word 3 (bytes 96-127): offset \u0111\u1ebfn parentHash string
+        # Word 4 (bytes128-159): uint256 timestamp
+
+        exists    = int(hex_data[0:64], 16) == 1
+        owner_raw = hex_data[64:128]
+        owner     = "0x" + owner_raw[-40:]  # L\u1ea5y 20 byte cu\u1ed1i = address
+        wm_offset = int(hex_data[128:192], 16)   # byte offset c\u1ee7a watermarkId string
+        ph_offset = int(hex_data[192:256], 16)   # byte offset c\u1ee7a parentHash string
+        timestamp = int(hex_data[256:320], 16)
+
+        watermark_id = _abi_decode_string(hex_data, wm_offset)
+        parent_hash  = _abi_decode_string(hex_data, ph_offset)
+
+        etherscan_url = (
+            f"https://sepolia.etherscan.io/address/{owner}"
+            if exists else None
+        )
+
+        print(f"[ONCHAIN-CHECK] sha={sha[:16]}... exists={exists} owner={owner[:12]}... wm={watermark_id}")
+
+        return JSONResponse({
+            "exists":       exists,
+            "owner":        owner if exists else None,
+            "watermark_id": watermark_id if exists else None,
+            "parent_hash":  parent_hash  if exists else None,
+            "timestamp":    timestamp    if exists else None,
+            "etherscan_url": etherscan_url,
+        })
+
+    except requests.exceptions.Timeout:
+        return JSONResponse({"error": "Timeout kết nối Sepolia RPC"}, status_code=504)
+    except Exception as e:
+        print(f"[ONCHAIN-CHECK] error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ============================================================
+# DIGITAL PROVENANCE (Gia Phả Số)
+# ============================================================
+@app.get("/provenance")
+def get_provenance(sha: str):
+    """Trả về cây gia phả số (digital provenance tree) của một ảnh."""
+    if not sha:
+        return JSONResponse({"error": "Missing sha parameter"}, status_code=400)
+
+    try:
+        with db_conn() as con:
+            # 1. Tìm record hiện tại
+            cur = con.execute(
+                "SELECT sha256, watermark_id, registrant_name, parent_hash, created_at, owner, registered, ipfs_link FROM sealed_records WHERE sha256 = ?",
+                (sha,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return JSONResponse({"error": "Record not found"}, status_code=404)
+
+            def row_to_dict(r):
+                return {
+                    "sha": r[0], "watermark_id": r[1], "registrant_name": r[2] or "",
+                    "parent_hash": r[3] or "", "created_at": r[4], "owner": r[5] or "",
+                    "registered": bool(r[6]), "ipfs_link": r[7] or "",
+                    "thumbnail": f"/thumbnail?sha={r[0]}&size=120"
+                }
+
+            start_node = row_to_dict(row)
+
+            # 2. Truy ngược lên tìm Root (tổ tiên xa nhất)
+            root_node = start_node
+            visited_shas = {root_node["sha"]}
+            
+            while root_node["parent_hash"]:
+                p_cur = con.execute(
+                    "SELECT sha256, watermark_id, registrant_name, parent_hash, created_at, owner, registered, ipfs_link FROM sealed_records WHERE sha256 = ?",
+                    (root_node["parent_hash"],)
+                )
+                p_row = p_cur.fetchone()
+                if not p_row:
+                    break # Không thấy parent trong DB (mất dấu)
+                root_node = row_to_dict(p_row)
+                if root_node["sha"] in visited_shas:
+                    break # Chống lặp vòng
+                visited_shas.add(root_node["sha"])
+
+            # 3. Quét BFS (chiều sâu xuống) từ root_node để lấy toàn bộ con cháu
+            all_nodes = {}
+            edges = []
+            
+            queue = [root_node["sha"]]
+            all_nodes[root_node["sha"]] = root_node
+            visited_bfs = {root_node["sha"]}
+
+            while queue:
+                curr_sha = queue.pop(0)
+                # Tìm tất cả node con mà parent_hash = curr_sha
+                child_cur = con.execute(
+                    "SELECT sha256, watermark_id, registrant_name, parent_hash, created_at, owner, registered, ipfs_link FROM sealed_records WHERE parent_hash = ?",
+                    (curr_sha,)
+                )
+                for c_row in child_cur.fetchall():
+                    c_node = row_to_dict(c_row)
+                    c_sha = c_node["sha"]
+                    edges.append({"from": curr_sha, "to": c_sha})
+                    
+                    if c_sha not in visited_bfs:
+                        visited_bfs.add(c_sha)
+                        all_nodes[c_sha] = c_node
+                        queue.append(c_sha)
+
+            return JSONResponse({
+                "query_sha": sha,
+                "root_sha": root_node["sha"],
+                "nodes": list(all_nodes.values()),
+                "edges": edges
+            })
+    except Exception as e:
+        print("[PROVENANCE] err:", e)
+        return JSONResponse({"error": str(e)}, status_code=500)

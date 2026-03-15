@@ -25,6 +25,70 @@
 	{
 		"inputs": [
 			{
+				"internalType": "uint256",
+				"name": "numerator",
+				"type": "uint256"
+			},
+			{
+				"internalType": "uint256",
+				"name": "denominator",
+				"type": "uint256"
+			}
+		],
+		"name": "ERC2981InvalidDefaultRoyalty",
+		"type": "error"
+	},
+	{
+		"inputs": [
+			{
+				"internalType": "address",
+				"name": "receiver",
+				"type": "address"
+			}
+		],
+		"name": "ERC2981InvalidDefaultRoyaltyReceiver",
+		"type": "error"
+	},
+	{
+		"inputs": [
+			{
+				"internalType": "uint256",
+				"name": "tokenId",
+				"type": "uint256"
+			},
+			{
+				"internalType": "uint256",
+				"name": "numerator",
+				"type": "uint256"
+			},
+			{
+				"internalType": "uint256",
+				"name": "denominator",
+				"type": "uint256"
+			}
+		],
+		"name": "ERC2981InvalidTokenRoyalty",
+		"type": "error"
+	},
+	{
+		"inputs": [
+			{
+				"internalType": "uint256",
+				"name": "tokenId",
+				"type": "uint256"
+			},
+			{
+				"internalType": "address",
+				"name": "receiver",
+				"type": "address"
+			}
+		],
+		"name": "ERC2981InvalidTokenRoyaltyReceiver",
+		"type": "error"
+	},
+	{
+		"inputs": [
+			{
 				"internalType": "address",
 				"name": "sender",
 				"type": "address"
@@ -258,6 +322,11 @@
 				"internalType": "string",
 				"name": "_tokenURI",
 				"type": "string"
+			},
+			{
+				"internalType": "uint96",
+				"name": "_royaltyBps",
+				"type": "uint96"
 			}
 		],
 		"name": "registerCopyright",
@@ -469,7 +538,7 @@
 		"inputs": [
 			{
 				"internalType": "string",
-				"name": "",
+				"name": "_sha256",
 				"type": "string"
 			}
 		],
@@ -512,7 +581,7 @@
 		"inputs": [
 			{
 				"internalType": "string",
-				"name": "",
+				"name": "_sha256",
 				"type": "string"
 			}
 		],
@@ -587,6 +656,35 @@
 			{
 				"internalType": "uint256",
 				"name": "timestamp",
+				"type": "uint256"
+			}
+		],
+		"stateMutability": "view",
+		"type": "function"
+	},
+	{
+		"inputs": [
+			{
+				"internalType": "uint256",
+				"name": "tokenId",
+				"type": "uint256"
+			},
+			{
+				"internalType": "uint256",
+				"name": "salePrice",
+				"type": "uint256"
+			}
+		],
+		"name": "royaltyInfo",
+		"outputs": [
+			{
+				"internalType": "address",
+				"name": "receiver",
+				"type": "address"
+			},
+			{
+				"internalType": "uint256",
+				"name": "amount",
 				"type": "uint256"
 			}
 		],

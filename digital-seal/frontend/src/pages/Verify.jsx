@@ -1,5 +1,6 @@
 import { useState, useCallback } from "react";
 import { useDropzone } from "react-dropzone";
+import { Link } from "react-router-dom";
 import { ethers } from "ethers";
 import abi from "../abi/ImageRegistryABI.json";
 import { BACKEND_URL, CONTRACT_ADDRESS } from "../config.js";
@@ -40,16 +41,21 @@ export default function Verify() {
       const data=await r.json();
       let rec=null;
       try {
-        if(window.ethereum){
-          const p=new ethers.BrowserProvider(window.ethereum);
-          const ct=new ethers.Contract(CONTRACT_ADDRESS,abi,p);
-          if(data.sha256){
-            const rv=await ct.getRecordByHash(data.sha256);
-            // ABI returns: (exists, owner, watermarkId, parentHash, timestamp)
-            const existsOnChain = rv && (rv.exists === true || rv[0] === true);
-            const ownerAddr = rv && (rv.owner || rv[1]);
-            if(existsOnChain && ownerAddr && ownerAddr !== "0x0000000000000000000000000000000000000000") {
-              rec = rv;
+        // Dùng /onchain-check endpoint (không cần MetaMask kết nối)
+        // cũng check best_match.sha256 nếu ảnh upload là crop/derivative
+        const shaToCheck = data.sha256 || data.best_match?.sha256;
+        if (shaToCheck) {
+          const ocResp = await fetch(`${BACKEND_URL}/onchain-check?sha=${encodeURIComponent(shaToCheck)}`);
+          if (ocResp.ok) {
+            const ocData = await ocResp.json();
+            if (ocData.exists) rec = ocData;
+          }
+          // Nếu sha upload khác best_match.sha256 (crop/derivative) → check cả bản gốc
+          if (!rec && data.best_match?.sha256 && data.best_match.sha256 !== data.sha256) {
+            const ocResp2 = await fetch(`${BACKEND_URL}/onchain-check?sha=${encodeURIComponent(data.best_match.sha256)}`);
+            if (ocResp2.ok) {
+              const ocData2 = await ocResp2.json();
+              if (ocData2.exists) rec = ocData2;
             }
           }
         }
@@ -236,10 +242,18 @@ export default function Verify() {
                              padding:12,borderRadius:10,background:"rgba(255,255,255,.03)",
                              border:"1px solid rgba(255,255,255,.07)",fontFamily:"monospace",
                              fontSize:11,color:"#64748b",wordBreak:"break-all"}}>
-                  <span>SHA256 khớp: </span><span style={{color:"#818cf8"}}>{result.best_match.sha256}</span>
-                  <span style={{display:"block",marginTop:4}}>
-                    Chủ sở hữu: <span style={{color:"#c4b5fd"}}>{result.best_match.watermark_id}</span>
-                  </span>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                    <div>
+                      <span>SHA256 khớp: </span><span style={{color:"#818cf8"}}>{result.best_match.sha256}</span>
+                      <span style={{display:"block",marginTop:4}}>
+                        Chủ sở hữu: <span style={{color:"#c4b5fd"}}>{result.best_match.watermark_id}</span>
+                      </span>
+                    </div>
+                    <Link to={`/provenance?sha=${result.best_match.sha256}`} 
+                          style={{background:"rgba(99,102,241,0.2)",color:"#a5b4fc",padding:"6px 10px",borderRadius:6,textDecoration:"none",fontSize:12,fontWeight:600,flexShrink:0}}>
+                      🌳 Xem Gia Phả
+                    </Link>
+                  </div>
                 </div>
               )}
 
@@ -306,16 +320,22 @@ export default function Verify() {
             <h3 style={s.cTit}><span style={s.dot("#6366f1")}/>Hồ sơ Blockchain</h3>
             {chain?(
               <div>
-                <div style={s.row}><span style={{color:"#64748b"}}>Tác giả</span>
-                  <span style={{color:"#818cf8",fontFamily:"monospace",fontSize:12}}>{chain.author?.slice(0,16)}...</span></div>
+                <div style={s.row}><span style={{color:"#64748b"}}>Chủ sở hữu</span>
+                  <span style={{color:"#818cf8",fontFamily:"monospace",fontSize:12}}>
+                    {chain.owner ? chain.owner.slice(0,10) + '...' + chain.owner.slice(-6) : '—'}
+                  </span></div>
                 <div style={s.row}><span style={{color:"#64748b"}}>Định danh</span>
-                  <span style={{color:"#c4b5fd"}}>{chain.watermarkId}</span></div>
+                  <span style={{color:"#c4b5fd"}}>{chain.watermark_id || '—'}</span></div>
+                <div style={{...s.row}}><span style={{color:"#64748b"}}>Thời gian</span>
+                  <span style={{color:"#94a3b8",fontSize:11}}>
+                    {chain.timestamp ? new Date(chain.timestamp * 1000).toLocaleDateString('vi-VN') : '—'}
+                  </span></div>
                 <div style={{...s.row,borderBottom:"none"}}><span style={{color:"#64748b"}}>Trạng thái</span>
-                  <span style={{color:"#4ade80",fontWeight:600}}>✅ Đã xác minh</span></div>
-                {chain.ipfsLink&&<a href={chain.ipfsLink} target="_blank" rel="noreferrer"
+                  <span style={{color:"#4ade80",fontWeight:600}}>✅ Đã xác minh on-chain</span></div>
+                {chain.etherscan_url&&<a href={chain.etherscan_url} target="_blank" rel="noreferrer"
                   style={{display:"block",textAlign:"center",marginTop:14,padding:"9px",
                           borderRadius:10,background:"rgba(99,102,241,.1)",border:"1px solid rgba(99,102,241,.25)",
-                          color:"#818cf8",fontSize:13,fontWeight:600}}>📁 Xem IPFS</a>}
+                          color:"#818cf8",fontSize:13,fontWeight:600}}>🔗 Xem trên Etherscan</a>}
               </div>
             ):(
               <div style={{textAlign:"center",padding:"24px 0",color:"#334155",fontSize:13}}>

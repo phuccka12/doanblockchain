@@ -6,93 +6,144 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
+// URL backend local (thay đổi nếu deploy production)
+const BACKEND = "http://127.0.0.1:8000";
+
 chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === "trustlens-check") {
-    
-    // Bắn thông báo chờ
-    chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => {
-        const div = document.createElement('div');
-        div.id = 'trustlens-toast';
-        div.style.cssText = 'position:fixed; top:20px; right:20px; background:#333; color:#fff; padding:15px; z-index:99999; border-radius:8px; font-family:sans-serif; box-shadow: 0 4px 12px rgba(0,0,0,0.5);';
-        div.innerText = '⏳ TrustLens: Đang trích xuất ảnh và phân tích...';
-        document.body.appendChild(div);
-        setTimeout(() => div.remove(), 5000);
-      }
-    });
+  if (info.menuItemId !== "trustlens-check") return;
 
-    // --- LOGIC MỚI: XỬ LÝ BLOB & DATA URL ---
-    // Chúng ta bơm một hàm vào trang web để nó tự tải ảnh về thành Base64
-    chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      args: [info.srcUrl],
-      func: async (srcUrl) => {
-        try {
-          // 1. Dùng fetch của trình duyệt để tải dữ liệu blob/url
-          const response = await fetch(srcUrl);
-          const blob = await response.blob();
-          
-          // 2. Chuyển Blob thành Base64
-          return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result);
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-          });
-        } catch (err) {
-          return null;
-        }
-      }
-    }).then((results) => {
-      // Nhận kết quả Base64 từ trang web
-      const base64Data = results[0].result;
-      
-      if (!base64Data) {
-        alert("Lỗi: Không thể truy cập dữ liệu ảnh này (Do bảo mật của trang web).");
-        return;
-      }
+  // Hiện toast "đang xử lý"
+  chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: () => {
+      const old = document.getElementById('trustlens-toast');
+      if (old) old.remove();
+      const div = document.createElement('div');
+      div.id = 'trustlens-toast';
+      div.style.cssText = 'position:fixed;top:20px;right:20px;background:#1e1b4b;color:#a5b4fc;'
+        + 'padding:14px 18px;z-index:99999;border-radius:10px;font-family:sans-serif;'
+        + 'box-shadow:0 4px 20px rgba(0,0,0,.6);border:1px solid rgba(99,102,241,.4);font-size:14px;';
+      div.innerText = '⏳ TrustLens: Đang phân tích ảnh...';
+      document.body.appendChild(div);
+      setTimeout(() => div.remove(), 8000);
+    }
+  });
 
-      // Gửi Base64 về cho Python
-      fetch("http://127.0.0.1:8000/verify-url", {
+  // Lấy blob ảnh từ trang
+  chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    args: [info.srcUrl],
+    func: async (srcUrl) => {
+      try {
+        const response = await fetch(srcUrl);
+        const blob = await response.blob();
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+      } catch (err) { return null; }
+    }
+  }).then(async (results) => {
+    const base64Data = results[0].result;
+    if (!base64Data) {
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => alert("❌ Không thể truy cập ảnh này (CORS hoặc bảo mật trang web).")
+      });
+      return;
+    }
+
+    try {
+      // 1. Gọi /verify-url để phân tích AI
+      const res = await fetch(`${BACKEND}/verify-url`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image_url: base64Data }) // Gửi cả chuỗi data:image...
-      })
-      .then(res => res.json())
-      .then(data => {
-        // Hiển thị kết quả
-        chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: showResultOnPage,
-          args: [data]
-        });
-      })
-      .catch(err => {
-        console.error(err);
-        chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: () => alert("❌ Lỗi kết nối Server Python!")
-        });
+        body: JSON.stringify({ image_url: base64Data })
       });
-    });
-  }
+      const data = await res.json();
+
+      // 2. Gọi /onchain-check nếu có sha256 (từ best_match hoặc sha của ảnh upload)
+      let onchain = null;
+      const shaToCheck = data.sha256 || data.best_match?.sha256;
+      if (shaToCheck) {
+        try {
+          const ocRes = await fetch(`${BACKEND}/onchain-check?sha=${encodeURIComponent(shaToCheck)}`);
+          if (ocRes.ok) {
+            const ocData = await ocRes.json();
+            if (ocData.exists) onchain = ocData;
+          }
+          // Nếu chưa tìm thấy, thử sha của bản gốc (trường hợp crop/derivative)
+          if (!onchain && data.best_match?.sha256 && data.best_match.sha256 !== shaToCheck) {
+            const ocRes2 = await fetch(`${BACKEND}/onchain-check?sha=${encodeURIComponent(data.best_match.sha256)}`);
+            if (ocRes2.ok) {
+              const ocData2 = await ocRes2.json();
+              if (ocData2.exists) onchain = ocData2;
+            }
+          }
+        } catch (_) {}
+      }
+
+      // 3. Hiện kết quả trên trang
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: showResultOnPage,
+        args: [data, onchain]
+      });
+    } catch (err) {
+      console.error(err);
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => alert("❌ Lỗi kết nối TrustLens Backend! Đảm bảo uvicorn đang chạy.")
+      });
+    }
+  });
 });
 
-function showResultOnPage(data) {
-  // Xóa thông báo cũ nếu có
-  const oldToast = document.getElementById('trustlens-toast');
-  if(oldToast) oldToast.remove();
+function showResultOnPage(data, onchain) {
+  // Xóa toast cũ
+  const old = document.getElementById('trustlens-toast');
+  if (old) old.remove();
 
-  let message = "";
-  if (data.best_match && data.best_match.distance === 0) {
-    message = "✅ CHÍNH HÃNG! (Authentic)\nID: " + data.best_match.watermark_id;
-  } else if (data.best_match && data.best_match.distance < 10) {
-    message = "⚠️ CHÍNH CHỦ (Đã bị nén/Resize)\nID: " + data.best_match.watermark_id;
-  } else if (data.best_match && data.best_match.forgery_image) {
-    message = "🚨 PHÁT HIỆN ẢNH FAKE!\nCó vùng bị chỉnh sửa.";
+  const bm = data.best_match;
+
+  // ── Xác định verdict ──────────────────────────────────────────────────────
+  let icon, title, detail;
+
+  if (!bm) {
+    icon  = "⚪";
+    title = "KHÔNG RÕ NGUỒN GỐC";
+    detail = "Không tìm thấy ảnh tương tự trong cơ sở dữ liệu TrustLens.";
+  } else if (bm.forgery_image) {
+    icon  = "🚨";
+    title = "PHÁT HIỆN GIẢ MẠO / CAN THIỆP";
+    detail = `Ảnh khớp với bản gốc của "${bm.watermark_id}" nhưng bị phát hiện chỉnh sửa (crop / vẽ thêm).`;
+  } else if (bm.distance === 0) {
+    icon  = "✅";
+    title = "CHÍNH HÃNG — Nguyên bản";
+    detail = `Watermark: ${bm.watermark_id}`;
+  } else if (bm.distance <= 10) {
+    icon  = "✅";
+    title = "CHÍNH CHỦ (Có thể bị resize/nén nhẹ)";
+    detail = `Watermark: ${bm.watermark_id}  |  Khoảng cách hash: ${bm.distance} bit`;
   } else {
-    message = "🔴 KHÔNG RÕ NGUỒN GỐC.";
+    icon  = "⚠️";
+    title = "NGHI VẤN — Cần kiểm tra thêm";
+    detail = `Tương tự ảnh "${bm.watermark_id}" (khoảng cách: ${bm.distance} bit)`;
   }
-  alert("TrustLens Result:\n" + message);
+
+  // ── Thông tin on-chain ────────────────────────────────────────────────────
+  let chainLine = "";
+  if (onchain) {
+    const owner = onchain.owner
+      ? onchain.owner.slice(0, 10) + "..." + onchain.owner.slice(-6)
+      : "?";
+    const ts = onchain.timestamp
+      ? new Date(onchain.timestamp * 1000).toLocaleDateString("vi-VN")
+      : "?";
+    chainLine = `\n⛓️  Đã đăng ký on-chain\n   Owner: ${owner}\n   Watermark: ${onchain.watermark_id || "?"}\n   Ngày: ${ts}`;
+  }
+
+  alert(`TrustLens — Kết quả kiểm tra\n${"─".repeat(36)}\n${icon}  ${title}\n\n${detail}${chainLine}`);
 }

@@ -16,6 +16,14 @@ function normParentHash(raw) {
 
 const PALETTE=["#6366f1","#8b5cf6","#a855f7","#06b6d4","#10b981","#f59e0b"];
 
+const toGateway = (url) => {
+  if (!url) return "";
+  if (url.startsWith("https://") || url.startsWith("http://")) return url;
+  // Handle ipfs:// prefix (case insensitive)
+  let cid = url.replace(/^ipfs:\/\//i, "");
+  return `https://gateway.pinata.cloud/ipfs/${cid}`;
+};
+
 export default function Explorer() {
   const [sel,    setSel]    = useState(null);
   const [search, setSearch] = useState("");
@@ -102,47 +110,55 @@ export default function Explorer() {
     loadToken();
   }, [sel]);
 
-  // Load records from backend and enrich with on-chain parent info
+  // Load records from Blockchain directly
   useEffect(() => {
-    const load = async () => {
+    const loadOnChain = async () => {
       setLoading(true);
+      if (!window.ethereum) {
+        setLoading(false);
+        return; // require wallet
+      }
       try {
-        // registered_only=true → only confirmed on-chain records
-        // limit=0 → no cap, fetch ALL registered records so the count is always accurate
-        const res = await fetch(`${BACKEND_URL}/records?registered_only=true&limit=0`);
-        const j = await res.json();
-        const recs = (j.records || []);
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        const ct = new ethers.Contract(CONTRACT_ADDRESS, abi, provider);
+        
+        let localRecords = [];
+        // Loop token IDs starting from 1 until we hit a non-existent token
+        for (let i = 1; i <= 10000; i++) {
+          try {
+            const owner = await ct.ownerOf(i);
+            const rv = await ct.records(i);
+            const tokenURI = await ct.tokenURI(i).catch(()=>'');
+            const ipfs_link = toGateway(tokenURI);
 
-        if (window.ethereum && recs.length > 0) {
-          const provider = new ethers.BrowserProvider(window.ethereum);
-          const ct = new ethers.Contract(CONTRACT_ADDRESS, abi, provider);
-          // fetch on-chain metadata in parallel
-          const enriched = await Promise.all(recs.map(async (r) => {
-            try {
-              const rv = await ct.getRecordByHash(r.sha256);
-              const exists = rv.exists ?? rv[0];
-              const owner = rv.owner ?? rv[1];
-              const watermarkId = rv.watermarkId ?? rv[2];
-              // Normalise parentHash: ZeroHash → '' so UI correctly shows 'Tác phẩm gốc'
-              const parentHash = normParentHash(rv.parentHash ?? rv[3]);
-              return { ...r, owner, watermark_id: watermarkId || r.watermark_id, parentHash };
-            } catch (e) {
-              return { ...r, parentHash: '' };
-            }
-          }));
-          setRecords(enriched);
-        } else {
-          // if no wallet, still show backend-registered records (parentHash may be empty)
-          setRecords(recs.map(r=>({ ...r, parentHash: r.parentHash || '' })));
+            const parentHash = normParentHash(rv.parentHash);
+            const sha256 = rv.sha256Hash || '';
+            const watermarkId = rv.watermarkId || '';
+            const timestamp = Number(rv.timestamp?.toString?.() || 0);
+            
+            localRecords = [...localRecords, {
+              sha256,
+              watermark_id: watermarkId,
+              parentHash,
+              owner,
+              created_at: timestamp,
+              registered: true,
+              ipfs_link
+            }];
+            // Update state incrementally so UI doesn't freeze waiting for large collections
+            setRecords(localRecords);
+          } catch (err) {
+            // ERC721 error: "owner query for nonexistent token" -> end of list
+            break;
+          }
         }
       } catch (e) {
-        console.error(e);
-        setRecords([]);
+        console.error("Lỗi đồng bộ NFT Explorer On-chain:", e);
       } finally {
         setLoading(false);
       }
     };
-    load();
+    loadOnChain();
   }, []);
 
   // Build provenance chain for selected record using on-chain data when possible.
@@ -227,10 +243,10 @@ export default function Explorer() {
                     <div style={s.thumb(c)}>
                       {n.sha256 ? (
                         <img
-                          src={n.ipfs_link || `${BACKEND_URL}/thumbnail?sha=${encodeURIComponent(n.sha256)}&size=480`}
+                          src={`${BACKEND_URL}/thumbnail?sha=${encodeURIComponent(n.sha256)}&size=480`}
                           alt={n.watermark_id || 'thumb'}
                           style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-                          onError={e => { if (n.ipfs_link && !e.currentTarget.src.includes('thumbnail')) e.currentTarget.src = `${BACKEND_URL}/thumbnail?sha=${encodeURIComponent(n.sha256)}&size=480`; }}
+                          onError={(e) => { e.target.onerror = null; e.target.src = "https://placehold.co/400x400/1e293b/cbd5e1?text=No+Thumb"; }}
                         />
                       ) : (
                         '🖼️'
@@ -246,7 +262,21 @@ export default function Explorer() {
               })}
             </div>
           ):(
-            <div style={s.empty}><p style={{fontSize:36,margin:"0 0 12px"}}>🗂️</p><p>Không tìm thấy tác phẩm</p></div>
+            <div style={s.empty}>
+              {loading ? (
+                <>
+                  <div style={{...s.dot("#06b6d4"), margin:"0 auto 12px", animation:"pulse 2s infinite"}} />
+                  <p>Đang đồng bộ dữ liệu từ Blockchain mạng Sepolia...</p>
+                  <p style={{fontSize:12, color:"#64748b"}}>Vui lòng chờ trong giây lát</p>
+                </>
+              ) : (
+                <>
+                  <p style={{fontSize:36,margin:"0 0 12px"}}>🗂️</p>
+                  <p>Không tìm thấy tác phẩm</p>
+                  <p style={{fontSize:12, color:"#64748b"}}>Thử kết nối ví MetaMask hoặc kiểm tra mạng Sepolia</p>
+                </>
+              )}
+            </div>
           )}
         </div>
 
@@ -264,6 +294,12 @@ export default function Explorer() {
                     style={{background:"none",border:"none",color:"#475569",fontSize:20,cursor:"pointer",lineHeight:1}}>×</button>
                 </div>
                 <div style={s.row}><span style={{color:"#64748b"}}>SHA</span><span style={{color:"#818cf8"}}>{sel.sha256 ? sel.sha256.slice(0,16)+"…" : '—'}</span></div>
+                {sel.ipfs_link && (
+                  <div style={s.row}>
+                    <span style={{color:"#64748b"}}>Lưu trữ IPFS (Pinata)</span>
+                    <a href={toGateway(sel.ipfs_link)} target="_blank" rel="noreferrer" style={{color:"#4ade80", textDecoration:"none", fontWeight:600}}>↗ Mở Metadata</a>
+                  </div>
+                )}
                 <div style={{...s.row,alignItems:'center'}}>
                   <span style={{color:"#64748b"}}>Chứng thực On‑chain</span>
                   <span>
@@ -318,7 +354,7 @@ export default function Explorer() {
                             }}>
                             <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:6}}>
                               {thumb ? (
-                                <img src={thumb} alt={node.watermark_id||node.sha256} style={{width:120,height:80,objectFit:'cover',borderRadius:8}} />
+                                <img src={thumb} alt={node.watermark_id||node.sha256} style={{width:120,height:80,objectFit:'cover',borderRadius:8}} onError={(e) => { e.target.onerror = null; e.target.src = "https://placehold.co/120x80/1e293b/cbd5e1?text=No+Thumb"; }} />
                               ) : (
                                 <div style={{width:120,height:80,display:'flex',alignItems:'center',justifyContent:'center',background:'rgba(255,255,255,.02)',borderRadius:8}}>🖼️</div>
                               )}

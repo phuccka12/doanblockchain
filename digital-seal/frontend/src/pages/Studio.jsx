@@ -12,6 +12,13 @@ async function ensureSepolia() {
     await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: SEPOLIA_CHAIN_ID_HEX }] });
 }
 
+/** Chuyển "ipfs://Qm..." → "https://gateway.pinata.cloud/ipfs/Qm..." để mở được trong Chrome. */
+function ipfsToGateway(uri) {
+  if (!uri) return uri;
+  if (uri.startsWith('ipfs://')) return `https://gateway.pinata.cloud/ipfs/${uri.slice(7)}`;
+  return uri;
+}
+
 /* ---- inline style tokens ---- */
 const C = {
   page:    { minHeight:"100vh", background:"#080818", color:"#fff", fontFamily:"Inter,system-ui,sans-serif" },
@@ -92,14 +99,17 @@ function PRow({ label, pct, g1, g2, active }) {
 }
 
 export default function Studio() {
-  const [file, setFile]         = useState(null);
-  const [preview, setPreview]   = useState(null);
-  const [wid, setWid]           = useState("TrustLens_Artist");
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [step, setStep] = useState(0); // 0=init, 1=seal, 2=blockchain, 3=done
+  const [pct, setPct] = useState(0);
+  const [task, setTask] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // Form
   const [registrantName, setRegistrantName] = useState("");
-  const [busy, setBusy]         = useState(false);
-  const [pct, setPct]           = useState(0);
-  const [task, setTask]         = useState("");
-  const [step, setStep]         = useState(0);
+  const [wid, setWid] = useState("");
+  const [royaltyPct, setRoyaltyPct] = useState("5"); // ERC-2981 Royalty % (mặc định 5%)
   const [seal, setSeal]         = useState(null);
   const [txHash, setTxHash]     = useState("");
   const [sealedUrl, setSealedUrl] = useState(null); // blob URL của ảnh đã nhúng thủy vân
@@ -172,10 +182,50 @@ export default function Studio() {
     if (!wid.trim()) return toast.error("Vui lòng nhập định danh!");
     runningRef.current = true;
     try {
-      setBusy(true); setStep(1); setPct(15); setTask("Đang nhúng thủy vân số (DCT)...");
-  const form = new FormData(); form.append("file",file); form.append("watermark_id",wid);
-  form.append("registrant_name", registrantName);
+      setBusy(true); setStep(1); setPct(5); setTask("Kết nối ví MetaMask...");
+
+      // ── Bước 0: Ký xác thực quyền sở hữu ví trước khi seal ──────────────
+      let walletAddress = '';
+      let walletSignature = '';
+      if (window.ethereum) {
+        try {
+          await ensureSepolia();
+          const provider = new ethers.BrowserProvider(window.ethereum);
+          const signer   = await provider.getSigner();
+          walletAddress  = await signer.getAddress();
+
+          setTask("Ký xác thực với MetaMask...");
+          // Message format phải khớp với backend: "TrustLens|{watermark_id}|{wallet_address}"
+          const signMsg = `TrustLens|${wid}|${walletAddress}`;
+          walletSignature = await signer.signMessage(signMsg);
+          console.info('[Studio] Wallet signature OK:', walletAddress.slice(0,10));
+        } catch (sigErr) {
+          // User từ chối ký → dừng flow
+          if (sigErr.code === 4001 || sigErr.message?.includes('rejected')) {
+            toast.error('⛔ Bạn đã từ chối ký xác thực. Vui lòng ký để tiếp tục!');
+            setStep(0); setPct(0); setBusy(false); runningRef.current = false;
+            return;
+          }
+          // MetaMask không có hoặc lỗi khác → tiếp tục ở chế độ không chữ ký (dev)
+          console.warn('[Studio] signMessage failed (dev mode, no sig):', sigErr.message);
+          walletAddress = ''; walletSignature = '';
+        }
+      }
+      // ──────────────────────────────────────────────────────────────────────
+
+      setPct(15); setTask("Đang nhúng thủy vân số (DCT)...");
+      const form = new FormData();
+      form.append("file", file);
+      form.append("watermark_id", wid);
+      form.append("registrant_name", registrantName);
+      if (walletAddress)  form.append("wallet_address", walletAddress);
+      if (walletSignature) form.append("signature", walletSignature);
   const r = await fetch(`${BACKEND_URL}/seal`,{method:"POST",body:form});
+      if (r.status === 429) {
+        toast.error("⏳ Bạn đang gửi yêu cầu quá nhanh (Spam). Vui lòng đợi 1 phút rồi thử lại sau!", { duration: 6000 });
+        setStep(0); setPct(0); setBusy(false); runningRef.current = false;
+        return;
+      }
       if (r.status === 409) {
         // Duplicate / derivative detected by backend at seal time
         const errData = await r.json().catch(()=>({}));
@@ -310,21 +360,22 @@ export default function Studio() {
             console.info("Using legacy gasPrice override for tx");
           } catch(e) { console.warn("Invalid legacyGasHex, skipping override", e); }
         }
-        // Build _parentHash as bytes32: zero-hash if no parent, otherwise pad the hex SHA
-        // The contract stores bytes32; a plain SHA-256 hex string (64 chars) maps to 32 bytes.
-        let parentBytes32 = ethers.ZeroHash; // 0x000...000
-        if (parent) {
-          try {
-            // parent is a 64-char hex SHA256; convert to 0x-prefixed bytes32
-            const hex = parent.startsWith('0x') ? parent : '0x' + parent;
-            // Ensure it is exactly 32 bytes (pad if shorter, but SHA256 is always 32 bytes)
-            parentBytes32 = ethers.zeroPadValue(hex, 32);
-          } catch(e) {
-            console.warn('Could not encode parentHash as bytes32, using ZeroHash', e);
-            parentBytes32 = ethers.ZeroHash;
-          }
-        }
-        tx = await ct.registerCopyright(await signer.getAddress(), sha, wid, parentBytes32, ipfs||"", overrides);
+        // The new contract expects `_parentHash` as a string, no need for bytes32 padding
+        const parentHashStr = parent || "";
+        
+        // Calculate royalty basis points (Bps). E.g: 5.5% -> 5.5 * 100 = 550 Bps. Max is 10000 (100%).
+        const parsedRoyalty = parseFloat(royaltyPct) || 0;
+        const royaltyBps = Math.min(10000, Math.max(0, Math.floor(parsedRoyalty * 100)));
+
+        tx = await ct.registerCopyright(
+          await signer.getAddress(),
+          sha || "",
+          wid || "",
+          parentHashStr,
+          ipfs || "",
+          BigInt(royaltyBps),
+          overrides
+        );
         setTask("Ghi khối Sepolia..."); setPct(90);
         await tx.wait();
         // After on-chain confirmation, inform backend so record is marked registered
@@ -333,9 +384,15 @@ export default function Studio() {
           await fetch(`${BACKEND_URL}/confirm_registration`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sha, tx_hash: tx.hash, owner: ownerAddr, registrant_name: registrantName })
+            body: JSON.stringify({
+              sha,
+              tx_hash: tx.hash,
+              owner: ownerAddr,
+              registrant_name: registrantName,
+              parent_hash: parent || null
+            })
           });
-          console.info('Confirmed registration to backend', sha, tx.hash);
+          console.info('Confirmed registration to backend', sha, tx.hash, parent);
         } catch(err) {
           console.warn('Failed to confirm registration to backend', err);
         }
@@ -469,8 +526,8 @@ export default function Studio() {
                 {txHash && <a href={`https://sepolia.etherscan.io/tx/${txHash}`} target="_blank" rel="noreferrer"
                                style={{ color:"#818cf8",display:"block",marginTop:4,wordBreak:"break-all" }}>
                   Tx: {txHash.slice(0,32)}...</a>}
-                {seal.ipfs && <a href={seal.ipfs} target="_blank" rel="noreferrer"
-                                  style={{ color:"#fbbf24",display:"block",marginTop:4 }}>📁 IPFS</a>}
+                {seal.ipfs && <a href={ipfsToGateway(seal.ipfs)} target="_blank" rel="noreferrer"
+                                  style={{ color:"#fbbf24",display:"block",marginTop:4 }}>📁 Xem Metadata IPFS</a>}
               </div>
             )}
           </div>
@@ -507,6 +564,14 @@ export default function Studio() {
               onChange={e=>setWid(e.target.value)}
               disabled={busy||step===3}
               placeholder="Ví dụ: NguyenVanA_2026"/>
+
+            <label style={{...C.label,marginTop:12}}>
+              Tiền bản quyền NFT (%) <span style={{fontWeight:'normal',color:'#64748b'}}>(ERC-2981 Royalty)</span>
+            </label>
+            <input style={C.input} type="number" step="0.1" min="0" max="100" value={royaltyPct}
+              onChange={e=>setRoyaltyPct(e.target.value)}
+              disabled={busy||step===3}
+              placeholder="Ví dụ: 5"/>
 
             <div style={{ marginTop:20,paddingTop:16,borderTop:"1px solid rgba(255,255,255,.06)" }}>
               <div style={C.row}>

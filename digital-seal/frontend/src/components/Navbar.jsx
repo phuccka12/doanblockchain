@@ -8,6 +8,7 @@ const NAV = [
   { to:"/dashboard", label:"Dashboard",  icon:"📊" },
   { to:"/studio",    label:"Studio",     icon:"🔒" },
   { to:"/verify",    label:"Giám định",  icon:"🔬" },
+  { to:"/provenance",label:"Gia Phả",    icon:"🌳" },
   { to:"/explorer",  label:"NFT Explorer",icon:"🗂️" },
 ];
 
