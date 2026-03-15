@@ -6,8 +6,9 @@ ImageHash
 Pillow
 python-multipart
 requests
+pydantic
 reedsolo
-requests
+slowapi
 # Structural similarity (SSIM) used for robust crop/derivative detection
 scikit-image
 # Ethereum wallet signature verification (MetaMask eth_sign / personal_sign)
